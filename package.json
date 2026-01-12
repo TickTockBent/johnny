@@ -1,0 +1,73 @@
+{
+  "name": "@ticktockbent/johnny",
+  "version": "0.1.0",
+  "description": "A lightweight, project-agnostic semantic memory system for storing and retrieving text with embeddings",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "files": [
+    "dist",
+    "prisma/memory.prisma"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:unit": "vitest run src/__tests__/MockMemoryService.test.ts",
+    "test:integration": "vitest run src/__tests__/integration/",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:push": "prisma db push",
+    "db:reset": "prisma db push --force-reset",
+    "e2e": "tsx e2e/real-embeddings.ts",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm run test:run"
+  },
+  "keywords": [
+    "memory",
+    "embeddings",
+    "vector",
+    "rag",
+    "semantic-search",
+    "pgvector",
+    "prisma",
+    "openai",
+    "ai",
+    "llm"
+  ],
+  "author": "ticktockbent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ticktockbent/johnny"
+  },
+  "bugs": {
+    "url": "https://github.com/ticktockbent/johnny/issues"
+  },
+  "homepage": "https://github.com/ticktockbent/johnny#readme",
+  "peerDependencies": {
+    "@prisma/client": "^5.0.0 || ^6.0.0 || ^7.0.0"
+  },
+  "devDependencies": {
+    "@prisma/client": "^5.22.0",
+    "@types/node": "^20.0.0",
+    "dotenv": "^17.2.3",
+    "prisma": "^5.22.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

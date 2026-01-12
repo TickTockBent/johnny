@@ -1,0 +1,35 @@
+// Johnny Memory Model
+// Add this to your application's schema.prisma file
+//
+// Prerequisites:
+// 1. Enable pgvector extension: CREATE EXTENSION IF NOT EXISTS vector;
+// 2. After running `prisma db push`, create the vector index:
+//    CREATE INDEX memory_embedding_idx ON "Memory"
+//    USING ivfflat (embedding vector_cosine_ops)
+//    WITH (lists = 100);
+
+model Memory {
+  id              String    @id @default(cuid())
+  namespace       String
+  content         String    @db.Text
+  embedding       Unsupported("vector(1536)")?
+
+  // Flexible metadata
+  type            String?
+  tags            String[]  @default([])
+  source          String?
+  importance      Float?
+
+  // Lifecycle
+  expiresAt       DateTime?
+  lastMentionedAt DateTime?
+  mentionCount    Int       @default(0)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([namespace])
+  @@index([namespace, type])
+  @@index([namespace, source])
+  @@index([expiresAt])
+}

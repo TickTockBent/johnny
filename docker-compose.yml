@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: johnny-postgres
+    environment:
+      POSTGRES_USER: johnny
+      POSTGRES_PASSWORD: johnny_dev
+      POSTGRES_DB: johnny_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - johnny_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U johnny -d johnny_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  johnny_postgres_data:

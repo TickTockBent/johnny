@@ -1,0 +1,24 @@
+# Source files (dist is published)
+src/
+e2e/
+
+# Test and dev config
+vitest.config.ts
+docker-compose.yml
+.env
+.env.*
+
+# Prisma dev schema (only memory.prisma reference is published)
+prisma/schema.prisma
+
+# Test artifacts
+coverage/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore
