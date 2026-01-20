@@ -1,4 +1,4 @@
-import { Sql, join as sqlJoin, sqltag as sql } from '@prisma/client/runtime/library'
+import { Sql, sqlJoin, sql } from './prisma-runtime-compat'
 import type {
   MemoryServiceOptions,
   PrismaClientLike,

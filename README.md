@@ -28,6 +28,15 @@ Johnny requires these packages in your project:
 npm install @prisma/client
 ```
 
+Johnny is compatible with Prisma versions 5 and 7. Install the version that matches your project:
+
+```bash
+npm install @prisma/client@^5.0.0  # Prisma 5.x (fully tested)
+npm install @prisma/client@^7.0.0  # Prisma 7.x (fully tested)
+```
+
+**Note:** Prisma 6.x support is untested and may have compatibility issues. We recommend using Prisma 5.x or upgrading to 7.x.
+
 ## Quick Start
 
 ### 1. Add the Memory model to your Prisma schema
