@@ -1,6 +1,6 @@
 {
   "name": "@ticktockbent/johnny",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A lightweight, project-agnostic semantic memory system for storing and retrieving text with embeddings",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -56,7 +56,7 @@
   },
   "homepage": "https://github.com/ticktockbent/johnny#readme",
   "peerDependencies": {
-    "@prisma/client": "^5.0.0 || ^6.0.0 || ^7.0.0"
+    "@prisma/client": "^5.0.0 || ^7.0.0"
   },
   "devDependencies": {
     "@prisma/client": "^5.22.0",
