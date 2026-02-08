@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-07
+
+### Added
+- **Custom embedding providers** - New `EmbeddingProvider` interface and `OpenAIEmbeddingProvider` class. Pass any provider via the `embeddingProvider` constructor option to use Ollama, Cohere, local models, etc.
+- **IMemoryService interface** - Shared contract implemented by both `MemoryService` and `MockMemoryService`, ensuring both stay in sync
+- **`updateContent(id, content, metadata?)`** - Update a memory's content and automatically regenerate its embedding
+- **`upsert(namespace, key, content, metadata?)`** - Atomic insert-or-update using `source` as the unique key within a namespace. Uses COALESCE semantics to preserve existing metadata for omitted fields
+- **`searchAcross(namespaces, query, options?)`** - Search across multiple namespaces in a single call. Returns `CrossNamespaceSearchResult` with a `namespace` field
+- **`listNamespaces(prefix?)`** - List all distinct namespaces, optionally filtered by prefix
+- **`getStatsMulti(namespaces)`** - Get statistics for multiple namespaces in one call
+- **Relevance decay** - New `decayOptions` parameter on `search()` and `searchAcross()` with configurable `halfLifeHours` and `reinforceOnMention`. Uses exponential decay with `GREATEST(0, ...)` guard against clock skew
+- **`updatedAt` in search results** - `MemorySearchResult` now includes the `updatedAt` field
+- New exported types: `CrossNamespaceSearchResult`, `DecayOptions`, `IMemoryService`, `EmbeddingProvider`
+
+### Changed
+- **Schema: `@@index([namespace, source])` → `@@unique([namespace, source])`** - Required for `upsert()` ON CONFLICT. This is a **schema migration** — see [MIGRATION.md](MIGRATION.md) for upgrade instructions
+- `storeMany()` now uses efficient multi-row INSERT (chunked at 5000 rows) instead of individual inserts
+- `embeddingApiKey` is now optional in `MemoryServiceOptions` (not needed when `embeddingProvider` is set)
+- Constructor validates that at least one of `embeddingApiKey` or `embeddingProvider` is provided
+
+### Fixed
+- N/A
+
 ## [0.2.0] - 2026-01-20
 
 ### Added

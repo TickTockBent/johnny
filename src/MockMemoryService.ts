@@ -5,7 +5,9 @@ import type {
   CreateMemory,
   SearchOptions,
   MemorySearchResult,
+  CrossNamespaceSearchResult,
   NamespaceStats,
+  IMemoryService,
 } from './types'
 import { NotFoundError, NamespaceRequiredError } from './errors'
 
@@ -38,7 +40,7 @@ interface InternalMemory extends Memory {
  * memory.clear() // Reset between tests
  * ```
  */
-export class MockMemoryService {
+export class MockMemoryService implements IMemoryService {
   private memories: Map<string, InternalMemory> = new Map()
   private idCounter = 0
   private readonly defaultNamespace?: string
@@ -224,10 +226,23 @@ export class MockMemoryService {
         // Convert cosine similarity to distance (lower = more similar)
         const similarity = this.cosineSimilarity(queryEmbedding, memory.embedding)
         const distance = 1 - similarity
-        return { memory, distance }
+
+        // Compute decay multiplier if configured
+        let adjustedDistance = distance
+        if (options?.decayOptions) {
+          const halfLifeMs = options.decayOptions.halfLifeHours * 60 * 60 * 1000
+          const referenceTime = options.decayOptions.reinforceOnMention && memory.lastMentionedAt
+            ? memory.lastMentionedAt
+            : memory.createdAt
+          const ageMs = Math.max(0, now.getTime() - referenceTime.getTime())
+          // Matches SQL: distance * exp(ln(2) * age / halfLife)
+          adjustedDistance = distance * Math.exp(Math.LN2 * ageMs / halfLifeMs)
+        }
+
+        return { memory, distance, adjustedDistance }
       })
       .filter((result) => result.distance < maxDistance)
-      .sort((a, b) => a.distance - b.distance)
+      .sort((a, b) => a.adjustedDistance - b.adjustedDistance)
       .slice(0, limit)
 
     return candidates.map(({ memory, distance }) => ({
@@ -239,6 +254,87 @@ export class MockMemoryService {
       importance: memory.importance,
       distance,
       createdAt: memory.createdAt,
+      updatedAt: memory.updatedAt,
+      lastMentionedAt: memory.lastMentionedAt,
+      mentionCount: memory.mentionCount,
+    }))
+  }
+
+  /**
+   * Search across multiple namespaces in a single pass.
+   * Note: mock uses deterministic hash-based embeddings, so cross-namespace
+   * ordering is consistent but semantically meaningless.
+   */
+  async searchAcross(
+    namespaces: string[],
+    query: string,
+    options?: SearchOptions
+  ): Promise<CrossNamespaceSearchResult[]> {
+    if (namespaces.length === 0) return []
+
+    const limit = options?.limit ?? 10
+    const maxDistance = options?.maxDistance ?? 0.5
+    const queryEmbedding = this.mockEmbeddingFn(query)
+    const now = new Date()
+
+    const candidates = Array.from(this.memories.values())
+      .filter((memory) => {
+        if (!namespaces.includes(memory.namespace)) return false
+
+        if (options?.types?.length) {
+          if (memory.type === null || !options.types.includes(memory.type)) return false
+        }
+
+        if (options?.tags?.length) {
+          if (!options.tags.every((tag) => memory.tags.includes(tag))) return false
+        }
+
+        if (options?.minImportance !== undefined) {
+          if (memory.importance === null || memory.importance < options.minImportance) return false
+        }
+
+        if (options?.excludeMentionedWithin !== undefined && memory.lastMentionedAt) {
+          const hoursAgo = new Date(
+            now.getTime() - options.excludeMentionedWithin * 60 * 60 * 1000
+          )
+          if (memory.lastMentionedAt >= hoursAgo) return false
+        }
+
+        if (memory.expiresAt && memory.expiresAt < now) return false
+
+        return true
+      })
+      .map((memory) => {
+        const similarity = this.cosineSimilarity(queryEmbedding, memory.embedding)
+        const distance = 1 - similarity
+
+        let adjustedDistance = distance
+        if (options?.decayOptions) {
+          const halfLifeMs = options.decayOptions.halfLifeHours * 60 * 60 * 1000
+          const referenceTime = options.decayOptions.reinforceOnMention && memory.lastMentionedAt
+            ? memory.lastMentionedAt
+            : memory.createdAt
+          const ageMs = Math.max(0, now.getTime() - referenceTime.getTime())
+          adjustedDistance = distance * Math.exp(Math.LN2 * ageMs / halfLifeMs)
+        }
+
+        return { memory, distance, adjustedDistance }
+      })
+      .filter((result) => result.distance < maxDistance)
+      .sort((a, b) => a.adjustedDistance - b.adjustedDistance)
+      .slice(0, limit)
+
+    return candidates.map(({ memory, distance }) => ({
+      id: memory.id,
+      namespace: memory.namespace,
+      content: memory.content,
+      type: memory.type,
+      tags: memory.tags,
+      source: memory.source,
+      importance: memory.importance,
+      distance,
+      createdAt: memory.createdAt,
+      updatedAt: memory.updatedAt,
       lastMentionedAt: memory.lastMentionedAt,
       mentionCount: memory.mentionCount,
     }))
@@ -268,6 +364,69 @@ export class MockMemoryService {
     memory.updatedAt = new Date()
 
     return this.toPublicMemory(memory)
+  }
+
+  /**
+   * Update a memory's content with re-embedding, and optionally update metadata.
+   * Preserves createdAt. Does not touch mentionCount or lastMentionedAt.
+   */
+  async updateContent(
+    id: string,
+    content: string,
+    metadata?: MemoryUpdate
+  ): Promise<Memory> {
+    const memory = this.memories.get(id)
+    if (!memory) {
+      throw new NotFoundError(id)
+    }
+
+    memory.content = content
+    memory.embedding = this.mockEmbeddingFn(content)
+    memory.updatedAt = new Date()
+
+    if (metadata?.type !== undefined) memory.type = metadata.type
+    if (metadata?.tags !== undefined) memory.tags = metadata.tags
+    if (metadata?.importance !== undefined) memory.importance = metadata.importance
+    if (metadata?.expiresAt !== undefined) memory.expiresAt = metadata.expiresAt
+
+    return this.toPublicMemory(memory)
+  }
+
+  /**
+   * Insert or update a memory by namespace + key.
+   * The key maps to the `source` field. Uses COALESCE logic for metadata.
+   */
+  async upsert(
+    namespace: string | undefined,
+    key: string,
+    content: string,
+    metadata?: Omit<MemoryMetadata, 'source'>
+  ): Promise<Memory> {
+    const ns = this.resolveNamespace(namespace)
+
+    // Find existing by namespace + source (key)
+    const existing = Array.from(this.memories.values()).find(
+      (m) => m.namespace === ns && m.source === key
+    )
+
+    if (existing) {
+      // Update in place — COALESCE: only overwrite if provided
+      existing.content = content
+      existing.embedding = this.mockEmbeddingFn(content)
+      if (metadata?.type !== undefined) existing.type = metadata.type
+      if (metadata?.tags !== undefined && metadata.tags.length > 0) existing.tags = metadata.tags
+      if (metadata?.importance !== undefined) existing.importance = metadata.importance
+      if (metadata?.expiresAt !== undefined) existing.expiresAt = metadata.expiresAt
+      existing.updatedAt = new Date()
+      // Preserve: id, createdAt, mentionCount, lastMentionedAt
+      return this.toPublicMemory(existing)
+    } else {
+      // Create new
+      return this.store(ns, content, {
+        ...metadata,
+        source: key,
+      })
+    }
   }
 
   /**
@@ -365,6 +524,30 @@ export class MockMemoryService {
       newestMemory: newest,
       expiringWithin7Days: expiringCount,
     }
+  }
+
+  /**
+   * List distinct namespaces, optionally filtered by prefix.
+   */
+  async listNamespaces(prefix?: string): Promise<string[]> {
+    const namespaces = new Set<string>()
+    for (const memory of this.memories.values()) {
+      if (!prefix || memory.namespace.startsWith(prefix)) {
+        namespaces.add(memory.namespace)
+      }
+    }
+    return Array.from(namespaces).sort()
+  }
+
+  /**
+   * Get statistics for multiple namespaces in a single call.
+   */
+  async getStatsMulti(namespaces: string[]): Promise<Map<string, NamespaceStats>> {
+    const result = new Map<string, NamespaceStats>()
+    for (const ns of namespaces) {
+      result.set(ns, await this.getStats(ns))
+    }
+    return result
   }
 
   /**

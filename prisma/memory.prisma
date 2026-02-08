@@ -7,6 +7,11 @@
 //    CREATE INDEX memory_embedding_idx ON "Memory"
 //    USING ivfflat (embedding vector_cosine_ops)
 //    WITH (lists = 100);
+//
+// NOTE: The vector dimension (1536) must match your embedding provider's dimensions.
+// OpenAI text-embedding-3-small: 1536
+// OpenAI text-embedding-3-large: 3072
+// nomic-embed-text: 768
 
 model Memory {
   id              String    @id @default(cuid())
@@ -30,6 +35,6 @@ model Memory {
 
   @@index([namespace])
   @@index([namespace, type])
-  @@index([namespace, source])
+  @@unique([namespace, source])
   @@index([expiresAt])
 }

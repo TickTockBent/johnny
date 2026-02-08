@@ -34,6 +34,6 @@ model Memory {
 
   @@index([namespace])
   @@index([namespace, type])
-  @@index([namespace, source])
+  @@unique([namespace, source])
   @@index([expiresAt])
 }

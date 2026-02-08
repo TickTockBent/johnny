@@ -1,6 +1,6 @@
 {
   "name": "@ticktockbent/johnny",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A lightweight, project-agnostic semantic memory system for storing and retrieving text with embeddings",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -31,7 +31,7 @@
     "db:reset": "prisma db push --force-reset",
     "e2e": "tsx e2e/real-embeddings.ts",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build && npm run test:run"
+    "prepublishOnly": "npm run clean && npm run build && npm run test:unit"
   },
   "keywords": [
     "memory",

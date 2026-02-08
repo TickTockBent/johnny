@@ -1,6 +1,10 @@
 // Core service
 export { MemoryService } from './MemoryService'
 
+// Embedding providers
+export { OpenAIEmbeddingProvider } from './EmbeddingProvider'
+export type { EmbeddingProvider } from './EmbeddingProvider'
+
 // Mock service (also available via '@wes/johnny/testing')
 export { MockMemoryService } from './MockMemoryService'
 export type { MockMemoryServiceOptions } from './MockMemoryService'
@@ -15,7 +19,10 @@ export type {
   CreateMemory,
   SearchOptions,
   MemorySearchResult,
+  CrossNamespaceSearchResult,
+  DecayOptions,
   NamespaceStats,
+  IMemoryService,
 } from './types'
 
 // Errors
