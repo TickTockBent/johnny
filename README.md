@@ -334,3 +334,6 @@ This keeps Johnny focused and flexible across different use cases.
 ## License
 
 MIT
+---
+
+*Part of a growing suite of literary-named MCP servers. See more at [github.com/TickTockBent](https://github.com/TickTockBent).*
