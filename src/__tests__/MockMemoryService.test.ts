@@ -585,4 +585,703 @@ describe('MockMemoryService', () => {
       expect(callCount).toBe(3)
     })
   })
+
+  describe('search() with updatedAt', () => {
+    it('returns updatedAt in search results', async () => {
+      await service.store(undefined, 'Hello world')
+      const results = await service.search(undefined, 'Hello world', { maxDistance: 1 })
+
+      expect(results.length).toBeGreaterThan(0)
+      expect(results[0].updatedAt).toBeInstanceOf(Date)
+    })
+  })
+
+  describe('updateContent()', () => {
+    it('updates content and returns the memory', async () => {
+      const original = await service.store(undefined, 'Original content')
+      const updated = await service.updateContent(original.id, 'New content')
+
+      expect(updated.id).toBe(original.id)
+      expect(updated.content).toBe('New content')
+    })
+
+    it('preserves createdAt', async () => {
+      const original = await service.store(undefined, 'Original content')
+      const updated = await service.updateContent(original.id, 'New content')
+
+      expect(updated.createdAt).toEqual(original.createdAt)
+    })
+
+    it('updates updatedAt', async () => {
+      const original = await service.store(undefined, 'Original content')
+      // Small delay to ensure different timestamp
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const updated = await service.updateContent(original.id, 'New content')
+
+      expect(updated.updatedAt.getTime()).toBeGreaterThanOrEqual(original.updatedAt.getTime())
+    })
+
+    it('does not touch mentionCount or lastMentionedAt', async () => {
+      const original = await service.store(undefined, 'Original content')
+      await service.recordMention(original.id)
+      const afterMention = await service.get(original.id)
+      const updated = await service.updateContent(original.id, 'New content')
+
+      expect(updated.mentionCount).toBe(afterMention!.mentionCount)
+      expect(updated.lastMentionedAt).toEqual(afterMention!.lastMentionedAt)
+    })
+
+    it('applies optional metadata updates', async () => {
+      const original = await service.store(undefined, 'Original content', {
+        type: 'fact',
+        importance: 0.5,
+      })
+      const updated = await service.updateContent(original.id, 'New content', {
+        type: 'preference',
+        tags: ['updated'],
+        importance: 0.9,
+      })
+
+      expect(updated.type).toBe('preference')
+      expect(updated.tags).toEqual(['updated'])
+      expect(updated.importance).toBe(0.9)
+    })
+
+    it('regenerates embedding (findable by new content)', async () => {
+      const original = await service.store(undefined, 'I love hiking in the mountains')
+      await service.updateContent(original.id, 'Coffee beans and espresso machines')
+
+      const results = await service.search(undefined, 'Coffee beans and espresso machines', {
+        maxDistance: 1,
+      })
+      expect(results.some((r) => r.id === original.id)).toBe(true)
+    })
+
+    it('throws NotFoundError for non-existent ID', async () => {
+      await expect(
+        service.updateContent('non-existent', 'New content')
+      ).rejects.toThrow(NotFoundError)
+    })
+  })
+
+  describe('upsert()', () => {
+    it('creates a new memory when key does not exist', async () => {
+      const result = await service.upsert(undefined, 'contact:john', 'John is a developer')
+
+      expect(result.content).toBe('John is a developer')
+      expect(result.source).toBe('contact:john')
+      expect(result.namespace).toBe('test')
+    })
+
+    it('updates existing memory when key matches namespace+source', async () => {
+      const first = await service.upsert(undefined, 'contact:john', 'John is a developer')
+      const second = await service.upsert(undefined, 'contact:john', 'John is a senior developer')
+
+      expect(second.id).toBe(first.id)
+      expect(second.content).toBe('John is a senior developer')
+      expect(second.source).toBe('contact:john')
+    })
+
+    it('preserves createdAt on update', async () => {
+      const first = await service.upsert(undefined, 'contact:john', 'John is a developer')
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const second = await service.upsert(undefined, 'contact:john', 'Updated info')
+
+      expect(second.createdAt).toEqual(first.createdAt)
+    })
+
+    it('preserves mentionCount and lastMentionedAt on update', async () => {
+      const first = await service.upsert(undefined, 'contact:john', 'John is a developer')
+      await service.recordMention(first.id)
+      const afterMention = await service.get(first.id)
+      const second = await service.upsert(undefined, 'contact:john', 'Updated')
+
+      expect(second.mentionCount).toBe(afterMention!.mentionCount)
+      expect(second.lastMentionedAt).toEqual(afterMention!.lastMentionedAt)
+    })
+
+    it('applies metadata on create', async () => {
+      const result = await service.upsert(undefined, 'key', 'Content', {
+        type: 'entity',
+        tags: ['contact'],
+        importance: 0.8,
+      })
+
+      expect(result.type).toBe('entity')
+      expect(result.tags).toEqual(['contact'])
+      expect(result.importance).toBe(0.8)
+    })
+
+    it('preserves existing metadata when not provided on update (COALESCE)', async () => {
+      await service.upsert(undefined, 'key', 'Content', {
+        type: 'entity',
+        tags: ['contact'],
+        importance: 0.8,
+      })
+      const updated = await service.upsert(undefined, 'key', 'New content')
+
+      expect(updated.type).toBe('entity')
+      expect(updated.tags).toEqual(['contact'])
+      expect(updated.importance).toBe(0.8)
+    })
+
+    it('overwrites metadata when explicitly provided on update', async () => {
+      await service.upsert(undefined, 'key', 'Content', {
+        type: 'entity',
+        importance: 0.8,
+      })
+      const updated = await service.upsert(undefined, 'key', 'New content', {
+        type: 'contact',
+        importance: 0.5,
+      })
+
+      expect(updated.type).toBe('contact')
+      expect(updated.importance).toBe(0.5)
+    })
+
+    it('throws NamespaceRequiredError when no namespace', async () => {
+      const serviceNoDefault = new MockMemoryService()
+
+      await expect(
+        serviceNoDefault.upsert(undefined, 'key', 'Content')
+      ).rejects.toThrow(NamespaceRequiredError)
+    })
+
+    it('regenerates embedding on update', async () => {
+      await service.upsert(undefined, 'key', 'I love hiking in the mountains')
+      await service.upsert(undefined, 'key', 'Coffee beans and espresso machines')
+
+      const results = await service.search(undefined, 'Coffee beans and espresso machines', {
+        maxDistance: 1,
+      })
+      expect(results.some((r) => r.source === 'key')).toBe(true)
+    })
+
+    it('does not create duplicates', async () => {
+      await service.upsert(undefined, 'key', 'First')
+      await service.upsert(undefined, 'key', 'Second')
+      await service.upsert(undefined, 'key', 'Third')
+
+      expect(service.size).toBe(1)
+    })
+  })
+
+  describe('searchAcross()', () => {
+    it('searches across multiple namespaces', async () => {
+      await service.store('ns1', 'Coffee beans')
+      await service.store('ns2', 'Coffee machines')
+      await service.store('ns3', 'Tea leaves')
+
+      const results = await service.searchAcross(['ns1', 'ns2'], 'Coffee', {
+        maxDistance: 1,
+      })
+
+      expect(results.length).toBe(2)
+      expect(results.every((r) => ['ns1', 'ns2'].includes(r.namespace))).toBe(true)
+    })
+
+    it('includes namespace field in results', async () => {
+      await service.store('ns1', 'Some content')
+
+      const results = await service.searchAcross(['ns1'], 'Some content', {
+        maxDistance: 1,
+      })
+
+      expect(results.length).toBeGreaterThan(0)
+      expect(results[0].namespace).toBe('ns1')
+    })
+
+    it('returns empty array for empty namespaces', async () => {
+      const results = await service.searchAcross([], 'query')
+      expect(results).toEqual([])
+    })
+
+    it('does not return results from excluded namespaces', async () => {
+      await service.store('ns1', 'Content A')
+      await service.store('ns2', 'Content B')
+
+      const results = await service.searchAcross(['ns1'], 'Content', {
+        maxDistance: 1,
+      })
+
+      expect(results.every((r) => r.namespace === 'ns1')).toBe(true)
+    })
+
+    it('applies filters across namespaces', async () => {
+      await service.store('ns1', 'Important content', { importance: 0.9 })
+      await service.store('ns2', 'Unimportant content', { importance: 0.1 })
+
+      const results = await service.searchAcross(['ns1', 'ns2'], 'content', {
+        maxDistance: 1,
+        minImportance: 0.5,
+      })
+
+      expect(results.length).toBe(1)
+      expect(results[0].namespace).toBe('ns1')
+    })
+
+    it('includes updatedAt in results', async () => {
+      await service.store('ns1', 'Content')
+      const results = await service.searchAcross(['ns1'], 'Content', { maxDistance: 1 })
+
+      expect(results[0].updatedAt).toBeInstanceOf(Date)
+    })
+  })
+
+  describe('search() with decayOptions', () => {
+    it('ranks recent memories higher than old ones', async () => {
+      // Create two memories with different timestamps
+      const oldMemory = await service.store(undefined, 'Coffee beans are delicious')
+      // Manually backdate the old memory
+      const internalMemories = (service as any).memories as Map<string, any>
+      const oldInternal = internalMemories.get(oldMemory.id)
+      oldInternal.createdAt = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) // 90 days ago
+
+      const recentMemory = await service.store(undefined, 'Coffee beans are amazing')
+
+      const resultsWithDecay = await service.search(undefined, 'Coffee beans', {
+        maxDistance: 1,
+        decayOptions: { halfLifeHours: 720 }, // 30 days
+      })
+
+      // Recent memory should come first with decay
+      const recentIdx = resultsWithDecay.findIndex((r) => r.id === recentMemory.id)
+      const oldIdx = resultsWithDecay.findIndex((r) => r.id === oldMemory.id)
+      expect(recentIdx).toBeLessThan(oldIdx)
+    })
+
+    it('reinforceOnMention resets decay clock', async () => {
+      const memory = await service.store(undefined, 'Coffee beans are delicious')
+      // Backdate creation
+      const internalMemories = (service as any).memories as Map<string, any>
+      const internal = internalMemories.get(memory.id)
+      internal.createdAt = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) // 90 days ago
+
+      // Record a recent mention
+      await service.recordMention(memory.id)
+
+      const resultsWithReinforce = await service.search(undefined, 'Coffee beans', {
+        maxDistance: 1,
+        decayOptions: { halfLifeHours: 720, reinforceOnMention: true },
+      })
+
+      const resultsWithoutReinforce = await service.search(undefined, 'Coffee beans', {
+        maxDistance: 1,
+        decayOptions: { halfLifeHours: 720, reinforceOnMention: false },
+      })
+
+      // With reinforcement, the result should have a lower adjusted distance
+      // (better rank) because lastMentionedAt is recent
+      const withReinforceResult = resultsWithReinforce.find((r) => r.id === memory.id)
+      const withoutReinforceResult = resultsWithoutReinforce.find((r) => r.id === memory.id)
+      expect(withReinforceResult).toBeDefined()
+      expect(withoutReinforceResult).toBeDefined()
+    })
+
+    it('returns raw distance, not adjusted', async () => {
+      const memory = await service.store(undefined, 'Coffee beans')
+      // Backdate
+      const internalMemories = (service as any).memories as Map<string, any>
+      internalMemories.get(memory.id).createdAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+
+      const withDecay = await service.search(undefined, 'Coffee beans', {
+        maxDistance: 1,
+        decayOptions: { halfLifeHours: 720 },
+      })
+      const withoutDecay = await service.search(undefined, 'Coffee beans', {
+        maxDistance: 1,
+      })
+
+      // Raw distance should be the same regardless of decay option
+      const decayResult = withDecay.find((r) => r.id === memory.id)
+      const normalResult = withoutDecay.find((r) => r.id === memory.id)
+      expect(decayResult!.distance).toBe(normalResult!.distance)
+    })
+
+    it('without decayOptions, behavior is unchanged', async () => {
+      await service.store(undefined, 'Coffee beans')
+      await service.store(undefined, 'Tea leaves')
+
+      const normal = await service.search(undefined, 'Coffee', { maxDistance: 1 })
+      const noDecay = await service.search(undefined, 'Coffee', {
+        maxDistance: 1,
+        decayOptions: undefined,
+      })
+
+      expect(normal.map((r) => r.id)).toEqual(noDecay.map((r) => r.id))
+    })
+  })
+
+  describe('listNamespaces()', () => {
+    it('returns all distinct namespaces', async () => {
+      await service.store('ns1', 'Content A')
+      await service.store('ns2', 'Content B')
+      await service.store('ns1', 'Content C')
+
+      const namespaces = await service.listNamespaces()
+      expect(namespaces).toEqual(['ns1', 'ns2'])
+    })
+
+    it('filters by prefix', async () => {
+      await service.store('user:wes:entities', 'Entity')
+      await service.store('user:wes:voice', 'Voice')
+      await service.store('user:bob:entities', 'Entity')
+
+      const namespaces = await service.listNamespaces('user:wes:')
+      expect(namespaces).toEqual(['user:wes:entities', 'user:wes:voice'])
+    })
+
+    it('returns empty array when no match', async () => {
+      await service.store('ns1', 'Content')
+      const namespaces = await service.listNamespaces('nonexistent:')
+      expect(namespaces).toEqual([])
+    })
+
+    it('returns sorted results', async () => {
+      await service.store('c-namespace', 'C')
+      await service.store('a-namespace', 'A')
+      await service.store('b-namespace', 'B')
+
+      const namespaces = await service.listNamespaces()
+      expect(namespaces).toEqual(['a-namespace', 'b-namespace', 'c-namespace'])
+    })
+  })
+
+  describe('getStatsMulti()', () => {
+    it('returns stats for multiple namespaces', async () => {
+      await service.store('ns1', 'Content A', { type: 'fact' })
+      await service.store('ns1', 'Content B', { type: 'fact' })
+      await service.store('ns2', 'Content C', { type: 'event' })
+
+      const stats = await service.getStatsMulti(['ns1', 'ns2'])
+
+      expect(stats.get('ns1')!.totalMemories).toBe(2)
+      expect(stats.get('ns2')!.totalMemories).toBe(1)
+    })
+
+    it('includes empty stats for namespaces with no memories', async () => {
+      await service.store('ns1', 'Content')
+
+      const stats = await service.getStatsMulti(['ns1', 'ns-empty'])
+
+      expect(stats.get('ns-empty')!.totalMemories).toBe(0)
+    })
+
+    it('returns empty map for empty input', async () => {
+      const stats = await service.getStatsMulti([])
+      expect(stats.size).toBe(0)
+    })
+
+    it('matches getStats output per namespace', async () => {
+      await service.store('ns1', 'Content A', { type: 'fact' })
+      await service.store('ns1', 'Content B', { type: 'preference' })
+
+      const singleStats = await service.getStats('ns1')
+      const multiStats = await service.getStatsMulti(['ns1'])
+
+      expect(multiStats.get('ns1')).toEqual(singleStats)
+    })
+  })
+
+  describe('list()', () => {
+    // Helper: force a memory's internal createdAt/updatedAt so ordering tests
+    // are unambiguous regardless of wall-clock timing.
+    const setCreatedAt = (id: string, iso: string) => {
+      const internal = (service as unknown as {
+        memories: Map<string, { createdAt: Date; updatedAt: Date }>
+      }).memories.get(id)!
+      internal.createdAt = new Date(iso)
+      internal.updatedAt = new Date(iso)
+    }
+    const setLastMentionedAt = (id: string, iso: string | null) => {
+      const internal = (service as unknown as {
+        memories: Map<string, { lastMentionedAt: Date | null }>
+      }).memories.get(id)!
+      internal.lastMentionedAt = iso === null ? null : new Date(iso)
+    }
+
+    describe('filters', () => {
+      it('filters by types', async () => {
+        await service.store('ns', 'a', { type: 'fact' })
+        await service.store('ns', 'b', { type: 'preference' })
+        await service.store('ns', 'c', { type: 'fact' })
+
+        const results = await service.list('ns', { types: ['fact'] })
+
+        expect(results).toHaveLength(2)
+        expect(results.every((r) => r.type === 'fact')).toBe(true)
+      })
+
+      it('filters by tags with ALL-of semantics', async () => {
+        await service.store('ns', 'both', { tags: ['x', 'y'] })
+        await service.store('ns', 'only-x', { tags: ['x'] })
+        await service.store('ns', 'superset', { tags: ['x', 'y', 'z'] })
+
+        const results = await service.list('ns', { tags: ['x', 'y'] })
+
+        expect(results.map((r) => r.content).sort()).toEqual(['both', 'superset'])
+      })
+
+      it('filters by minImportance and excludes null importance', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-importance')
+
+        const results = await service.list('ns', { minImportance: 0.5 })
+
+        expect(results.map((r) => r.content)).toEqual(['high'])
+      })
+
+      it('filters by exact source match', async () => {
+        await service.store('ns', 'a', { source: 'doc:1' })
+        await service.store('ns', 'b', { source: 'doc:2' })
+
+        const results = await service.list('ns', { source: 'doc:1' })
+
+        expect(results.map((r) => r.content)).toEqual(['a'])
+      })
+
+      it('combines multiple filters', async () => {
+        await service.store('ns', 'match', { type: 'fact', tags: ['t'], importance: 0.8 })
+        await service.store('ns', 'wrong-type', { type: 'note', tags: ['t'], importance: 0.8 })
+        await service.store('ns', 'low-importance', { type: 'fact', tags: ['t'], importance: 0.2 })
+
+        const results = await service.list('ns', {
+          types: ['fact'],
+          tags: ['t'],
+          minImportance: 0.5,
+        })
+
+        expect(results.map((r) => r.content)).toEqual(['match'])
+      })
+    })
+
+    describe('ordering', () => {
+      it('defaults to createdAt desc', async () => {
+        const a = await service.store('ns', 'a')
+        const b = await service.store('ns', 'b')
+        const c = await service.store('ns', 'c')
+        setCreatedAt(a.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-02T00:00:00Z')
+        setCreatedAt(c.id, '2026-01-03T00:00:00Z')
+
+        const results = await service.list('ns')
+
+        expect(results.map((r) => r.content)).toEqual(['c', 'b', 'a'])
+      })
+
+      it('orders by createdAt asc', async () => {
+        const a = await service.store('ns', 'a')
+        const b = await service.store('ns', 'b')
+        setCreatedAt(a.id, '2026-01-02T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-01T00:00:00Z')
+
+        const results = await service.list('ns', { orderBy: 'createdAt', direction: 'asc' })
+
+        expect(results.map((r) => r.content)).toEqual(['b', 'a'])
+      })
+
+      it('orders by importance desc with NULLS LAST', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-a')
+        await service.store('ns', 'null-b')
+
+        const results = await service.list('ns', { orderBy: 'importance', direction: 'desc' })
+
+        // Non-null importance first (desc), then nulls last
+        expect(results.slice(0, 2).map((r) => r.content)).toEqual(['high', 'low'])
+        expect(results.slice(2).map((r) => r.content).sort()).toEqual(['null-a', 'null-b'])
+        expect(results[2].importance).toBeNull()
+        expect(results[3].importance).toBeNull()
+      })
+
+      it('orders by importance asc with NULLS LAST', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-importance')
+
+        const results = await service.list('ns', { orderBy: 'importance', direction: 'asc' })
+
+        // Ascending non-nulls first, nulls still last (overriding Postgres default)
+        expect(results.map((r) => r.content)).toEqual(['low', 'high', 'null-importance'])
+      })
+
+      it('orders by lastMentionedAt with NULLS LAST', async () => {
+        const a = await service.store('ns', 'mentioned-recent')
+        const b = await service.store('ns', 'mentioned-old')
+        await service.store('ns', 'never-mentioned')
+        setLastMentionedAt(a.id, '2026-05-01T00:00:00Z')
+        setLastMentionedAt(b.id, '2026-04-01T00:00:00Z')
+
+        const results = await service.list('ns', {
+          orderBy: 'lastMentionedAt',
+          direction: 'desc',
+        })
+
+        expect(results.map((r) => r.content)).toEqual([
+          'mentioned-recent',
+          'mentioned-old',
+          'never-mentioned',
+        ])
+        expect(results[2].lastMentionedAt).toBeNull()
+      })
+
+      it('breaks ties on id ascending', async () => {
+        // All share the same createdAt so the sort key ties for every row.
+        const a = await service.store('ns', 'first')
+        const b = await service.store('ns', 'second')
+        const c = await service.store('ns', 'third')
+        setCreatedAt(a.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(c.id, '2026-01-01T00:00:00Z')
+
+        const results = await service.list('ns', { orderBy: 'createdAt', direction: 'desc' })
+
+        // Despite desc, ties resolve by id ASC (mock-N insertion order)
+        expect(results.map((r) => r.id)).toEqual([a.id, b.id, c.id])
+      })
+    })
+
+    describe('pagination', () => {
+      beforeEach(async () => {
+        for (let index = 0; index < 5; index++) {
+          const memory = await service.store('ns', `item-${index}`)
+          setCreatedAt(memory.id, `2026-01-0${index + 1}T00:00:00Z`)
+        }
+      })
+
+      it('applies limit and offset slicing', async () => {
+        // createdAt desc → item-4, item-3, item-2, item-1, item-0
+        const results = await service.list('ns', { limit: 2, offset: 1 })
+
+        expect(results.map((r) => r.content)).toEqual(['item-3', 'item-2'])
+      })
+
+      it('returns empty array when offset is past the end', async () => {
+        const results = await service.list('ns', { offset: 100 })
+        expect(results).toEqual([])
+      })
+
+      it('clamps limit to MAX_LIST_LIMIT', async () => {
+        const results = await service.list('ns', { limit: 999999 })
+        // Only 5 rows exist, so clamping is not observable in count, but the
+        // call must not throw and must return all rows.
+        expect(results).toHaveLength(5)
+      })
+
+      it('defaults to a limit of 50 when omitted', async () => {
+        service.clear()
+        for (let index = 0; index < 60; index++) {
+          await service.store('ns', `item-${index}`)
+        }
+
+        const results = await service.list('ns')
+
+        expect(results).toHaveLength(50)
+      })
+
+      it('falls back to the default limit for non-finite input', async () => {
+        // NaN arrives easily via parseInt(req.query.limit) on a missing param.
+        // It must not disable the bound — in Postgres a NaN limit serializes to
+        // NULL, which means "no limit at all".
+        service.clear()
+        for (let index = 0; index < 60; index++) {
+          await service.store('ns', `item-${index}`)
+        }
+
+        expect(await service.list('ns', { limit: NaN })).toHaveLength(50)
+        expect(await service.list('ns', { limit: Infinity })).toHaveLength(50)
+        expect(await service.list('ns', { limit: -Infinity })).toHaveLength(50)
+      })
+
+      it('falls back to no offset for non-finite input', async () => {
+        const results = await service.list('ns', { offset: NaN })
+        expect(results.map((r) => r.content)).toEqual([
+          'item-4',
+          'item-3',
+          'item-2',
+          'item-1',
+          'item-0',
+        ])
+        expect(await service.list('ns', { offset: Infinity })).toHaveLength(5)
+      })
+
+      it('truncates fractional limit and offset', async () => {
+        // Postgres rounds LIMIT 1.5 up to 2 while Array.slice takes 1;
+        // truncating in one shared place keeps both implementations agreeing.
+        const results = await service.list('ns', { limit: 2.9, offset: 1.9 })
+        expect(results.map((r) => r.content)).toEqual(['item-3', 'item-2'])
+      })
+
+      it('treats negative limit as zero', async () => {
+        expect(await service.list('ns', { limit: -5 })).toEqual([])
+      })
+    })
+
+    describe('includeExpired', () => {
+      it('excludes expired memories by default', async () => {
+        await service.store('ns', 'fresh', { expiresAt: new Date(Date.now() + 60_000) })
+        await service.store('ns', 'expired', { expiresAt: new Date(Date.now() - 60_000) })
+
+        const results = await service.list('ns')
+
+        expect(results.map((r) => r.content)).toEqual(['fresh'])
+      })
+
+      it('includes expired memories when includeExpired is true', async () => {
+        await service.store('ns', 'fresh', { expiresAt: new Date(Date.now() + 60_000) })
+        await service.store('ns', 'expired', { expiresAt: new Date(Date.now() - 60_000) })
+
+        const results = await service.list('ns', { includeExpired: true })
+
+        expect(results.map((r) => r.content).sort()).toEqual(['expired', 'fresh'])
+      })
+    })
+
+    describe('namespace scoping', () => {
+      it('returns empty array for a namespace with no rows', async () => {
+        await service.store('ns', 'content')
+
+        const results = await service.list('empty-ns')
+
+        expect(results).toEqual([])
+      })
+
+      it('excludes rows from other namespaces', async () => {
+        await service.store('ns-a', 'a')
+        await service.store('ns-b', 'b')
+
+        const results = await service.list('ns-a')
+
+        expect(results.map((r) => r.content)).toEqual(['a'])
+      })
+
+      it('uses the default namespace when namespace is undefined', async () => {
+        await service.store(undefined, 'default-ns-content') // default is 'test'
+
+        const results = await service.list(undefined)
+
+        expect(results.map((r) => r.content)).toEqual(['default-ns-content'])
+      })
+
+      it('throws NamespaceRequiredError with no default and undefined namespace', async () => {
+        const serviceNoDefault = new MockMemoryService()
+
+        await expect(serviceNoDefault.list(undefined)).rejects.toThrow(
+          NamespaceRequiredError
+        )
+      })
+    })
+
+    it('returns the public Memory type (has namespace, no distance)', async () => {
+      await service.store('ns', 'content')
+
+      const results = await service.list('ns')
+
+      expect(results[0]).toHaveProperty('namespace', 'ns')
+      expect(results[0]).not.toHaveProperty('distance')
+      expect(results[0]).not.toHaveProperty('embedding')
+    })
+  })
 })

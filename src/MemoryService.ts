@@ -7,10 +7,16 @@ import type {
   MemoryUpdate,
   CreateMemory,
   SearchOptions,
+  ListOptions,
   MemorySearchResult,
+  CrossNamespaceSearchResult,
   NamespaceStats,
   RawSearchResult,
+  IMemoryService,
 } from './types'
+import type { EmbeddingProvider } from './EmbeddingProvider'
+import { OpenAIEmbeddingProvider } from './EmbeddingProvider'
+import { resolveListPagination } from './pagination'
 import {
   EmbeddingError,
   NotFoundError,
@@ -18,7 +24,6 @@ import {
   DatabaseError,
 } from './errors'
 
-const DEFAULT_EMBEDDING_MODEL = 'text-embedding-3-small'
 const DEFAULT_SEARCH_LIMIT = 10
 const DEFAULT_MAX_DISTANCE = 0.5
 const MAX_CONTENT_TOKENS = 8000
@@ -38,17 +43,25 @@ const MAX_CONTENT_TOKENS = 8000
  * const results = await memory.search('user:123', 'outdoor activities')
  * ```
  */
-export class MemoryService {
+export class MemoryService implements IMemoryService {
   private readonly prisma: PrismaClientLike
-  private readonly embeddingApiKey: string
-  private readonly embeddingModel: string
+  private readonly embeddingProvider: EmbeddingProvider
   private readonly defaultNamespace?: string
 
   constructor(options: MemoryServiceOptions) {
     this.prisma = options.prisma
-    this.embeddingApiKey = options.embeddingApiKey
-    this.embeddingModel = options.embeddingModel ?? DEFAULT_EMBEDDING_MODEL
     this.defaultNamespace = options.defaultNamespace
+
+    if (options.embeddingProvider) {
+      this.embeddingProvider = options.embeddingProvider
+    } else if (options.embeddingApiKey) {
+      this.embeddingProvider = new OpenAIEmbeddingProvider({
+        apiKey: options.embeddingApiKey,
+        model: options.embeddingModel,
+      })
+    } else {
+      throw new Error('Either embeddingProvider or embeddingApiKey must be provided')
+    }
   }
 
   /**
@@ -124,19 +137,20 @@ export class MemoryService {
       const contents = items.map((item) => this.truncateContent(item.content))
       const embeddings = await this.generateEmbeddings(contents)
 
-      // Insert all memories
-      const memories: Memory[] = []
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i]
-        const embeddingStr = `[${embeddings[i].join(',')}]`
+      // Chunk to respect Postgres ~65535 parameter limit (~13 params per row)
+      const CHUNK_SIZE = 5000
+      const allMemories: Memory[] = []
 
-        const result = await this.prisma.$queryRaw<Memory[]>`
-          INSERT INTO "Memory" (
-            id, namespace, content, embedding, type, tags, source,
-            importance, "expiresAt", "lastMentionedAt", "mentionCount",
-            "createdAt", "updatedAt"
-          )
-          VALUES (
+      for (let chunkStart = 0; chunkStart < items.length; chunkStart += CHUNK_SIZE) {
+        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, items.length)
+
+        // Build multi-row VALUES clause using sql template tags
+        const valueRows = []
+        for (let i = chunkStart; i < chunkEnd; i++) {
+          const item = items[i]
+          const embeddingStr = `[${embeddings[i].join(',')}]`
+
+          valueRows.push(sql`(
             gen_random_uuid()::text,
             ${ns},
             ${contents[i]},
@@ -150,14 +164,24 @@ export class MemoryService {
             0,
             NOW(),
             NOW()
+          )`)
+        }
+
+        const result = await this.prisma.$queryRaw<Memory[]>`
+          INSERT INTO "Memory" (
+            id, namespace, content, embedding, type, tags, source,
+            importance, "expiresAt", "lastMentionedAt", "mentionCount",
+            "createdAt", "updatedAt"
           )
+          VALUES ${sqlJoin(valueRows)}
           RETURNING id, namespace, content, type, tags, source, importance,
             "expiresAt", "lastMentionedAt", "mentionCount", "createdAt", "updatedAt"
         `
-        memories.push(result[0])
+
+        allMemories.push(...result)
       }
 
-      return memories
+      return allMemories
     } catch (error) {
       if (error instanceof EmbeddingError) throw error
       throw new DatabaseError('storeMany', error instanceof Error ? error : undefined)
@@ -185,48 +209,40 @@ export class MemoryService {
       const embedding = await this.generateEmbedding(query)
       const embeddingStr = `[${embedding.join(',')}]`
 
-      // Build WHERE conditions using sql tagged template for safe parameterization
+      // Build WHERE conditions using sql tagged template for safe parameterization.
+      // Namespace scoping stays inline; the shared filters come from the helper.
       const conditions: Sql[] = [
         sql`namespace = ${ns}`,
+        ...this.buildFilterConditions(options),
       ]
-
-      if (options?.types?.length) {
-        // Use sqlJoin for safe IN clause
-        conditions.push(sql`type IN (${sqlJoin(options.types)})`)
-      }
-
-      if (options?.tags?.length) {
-        // PostgreSQL array containment - cast the parameter array to text[]
-        conditions.push(sql`tags @> ${options.tags}::text[]`)
-      }
-
-      if (options?.minImportance !== undefined) {
-        conditions.push(sql`importance >= ${options.minImportance}`)
-      }
-
-      if (options?.excludeMentionedWithin !== undefined) {
-        const hoursAgo = new Date(Date.now() - options.excludeMentionedWithin * 60 * 60 * 1000)
-        conditions.push(
-          sql`("lastMentionedAt" IS NULL OR "lastMentionedAt" < ${hoursAgo})`
-        )
-      }
-
-      // Exclude expired memories
-      conditions.push(sql`("expiresAt" IS NULL OR "expiresAt" > NOW())`)
 
       // Join all conditions with AND using sqlJoin
       const whereClause = sqlJoin(conditions, ' AND ')
+
+      // Build order expression — apply decay if configured
+      let orderExpression: Sql
+      if (options?.decayOptions) {
+        const halfLife = options.decayOptions.halfLifeHours
+        const ageReference = options.decayOptions.reinforceOnMention
+          ? sql`COALESCE("lastMentionedAt", "createdAt")`
+          : sql`"createdAt"`
+        // adjusted_distance = distance * exp(ln(2) * age_hours / halfLife)
+        // GREATEST(0, ...) guards against future timestamps
+        orderExpression = sql`(embedding <=> ${embeddingStr}::vector) * exp(ln(2) * GREATEST(0, EXTRACT(EPOCH FROM (NOW() - ${ageReference})) / 3600.0) / ${halfLife})`
+      } else {
+        orderExpression = sql`embedding <=> ${embeddingStr}::vector`
+      }
 
       // Perform vector similarity search with fully parameterized query
       const results = await this.prisma.$queryRaw<RawSearchResult[]>`
         SELECT
           id, content, type, tags, source, importance,
           embedding <=> ${embeddingStr}::vector as distance,
-          "createdAt", "lastMentionedAt", "mentionCount"
+          "createdAt", "updatedAt", "lastMentionedAt", "mentionCount"
         FROM "Memory"
         WHERE ${whereClause}
           AND embedding <=> ${embeddingStr}::vector < ${maxDistance}
-        ORDER BY embedding <=> ${embeddingStr}::vector
+        ORDER BY ${orderExpression}
         LIMIT ${limit}
       `
 
@@ -239,12 +255,207 @@ export class MemoryService {
         importance: r.importance,
         distance: r.distance,
         createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
         lastMentionedAt: r.lastMentionedAt,
         mentionCount: r.mentionCount,
       }))
     } catch (error) {
       if (error instanceof EmbeddingError) throw error
       throw new DatabaseError('search', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Search across multiple namespaces in a single query.
+   *
+   * @param namespaces - Array of namespaces to search within
+   * @param query - The text query to find similar memories for
+   * @param options - Search options (limit, maxDistance, filters)
+   * @returns Array of memories with similarity scores and namespace
+   */
+  async searchAcross(
+    namespaces: string[],
+    query: string,
+    options?: SearchOptions
+  ): Promise<CrossNamespaceSearchResult[]> {
+    if (namespaces.length === 0) return []
+
+    const limit = options?.limit ?? DEFAULT_SEARCH_LIMIT
+    const maxDistance = options?.maxDistance ?? DEFAULT_MAX_DISTANCE
+
+    try {
+      const embedding = await this.generateEmbedding(query)
+      const embeddingStr = `[${embedding.join(',')}]`
+
+      const conditions: Sql[] = [
+        sql`namespace IN (${sqlJoin(namespaces)})`,
+        ...this.buildFilterConditions(options),
+      ]
+
+      const whereClause = sqlJoin(conditions, ' AND ')
+
+      // Build order expression — apply decay if configured
+      let orderExpression: Sql
+      if (options?.decayOptions) {
+        const halfLife = options.decayOptions.halfLifeHours
+        const ageReference = options.decayOptions.reinforceOnMention
+          ? sql`COALESCE("lastMentionedAt", "createdAt")`
+          : sql`"createdAt"`
+        orderExpression = sql`(embedding <=> ${embeddingStr}::vector) * exp(ln(2) * GREATEST(0, EXTRACT(EPOCH FROM (NOW() - ${ageReference})) / 3600.0) / ${halfLife})`
+      } else {
+        orderExpression = sql`embedding <=> ${embeddingStr}::vector`
+      }
+
+      const results = await this.prisma.$queryRaw<(RawSearchResult & { namespace: string })[]>`
+        SELECT
+          id, namespace, content, type, tags, source, importance,
+          embedding <=> ${embeddingStr}::vector as distance,
+          "createdAt", "updatedAt", "lastMentionedAt", "mentionCount"
+        FROM "Memory"
+        WHERE ${whereClause}
+          AND embedding <=> ${embeddingStr}::vector < ${maxDistance}
+        ORDER BY ${orderExpression}
+        LIMIT ${limit}
+      `
+
+      return results.map((r) => ({
+        id: r.id,
+        namespace: r.namespace,
+        content: r.content,
+        type: r.type,
+        tags: r.tags,
+        source: r.source,
+        importance: r.importance,
+        distance: r.distance,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+        lastMentionedAt: r.lastMentionedAt,
+        mentionCount: r.mentionCount,
+      }))
+    } catch (error) {
+      if (error instanceof EmbeddingError) throw error
+      throw new DatabaseError('searchAcross', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Build the shared, non-namespace WHERE conditions used by `search()`,
+   * `searchAcross()`, and `list()`. Keeping this in one place ensures the
+   * filter semantics (type IN, tags ALL-of, minImportance, source exact match,
+   * mention recency, expiry exclusion) stay identical across all read paths.
+   *
+   * @param options - Filter options; unspecified filters are omitted
+   * @returns Array of SQL fragments to AND together with the caller's namespace clause
+   */
+  private buildFilterConditions(options?: {
+    types?: string[]
+    tags?: string[]
+    minImportance?: number
+    source?: string
+    excludeMentionedWithin?: number
+    includeExpired?: boolean
+  }): Sql[] {
+    const conditions: Sql[] = []
+
+    if (options?.types?.length) {
+      // Use sqlJoin for safe IN clause
+      conditions.push(sql`type IN (${sqlJoin(options.types)})`)
+    }
+
+    if (options?.tags?.length) {
+      // PostgreSQL array containment - cast the parameter array to text[]
+      conditions.push(sql`tags @> ${options.tags}::text[]`)
+    }
+
+    if (options?.minImportance !== undefined) {
+      conditions.push(sql`importance >= ${options.minImportance}`)
+    }
+
+    if (options?.source !== undefined) {
+      conditions.push(sql`source = ${options.source}`)
+    }
+
+    if (options?.excludeMentionedWithin !== undefined) {
+      const hoursAgo = new Date(Date.now() - options.excludeMentionedWithin * 60 * 60 * 1000)
+      conditions.push(
+        sql`("lastMentionedAt" IS NULL OR "lastMentionedAt" < ${hoursAgo})`
+      )
+    }
+
+    // Exclude expired memories unless explicitly requested
+    if (!options?.includeExpired) {
+      conditions.push(sql`("expiresAt" IS NULL OR "expiresAt" > NOW())`)
+    }
+
+    return conditions
+  }
+
+  /**
+   * Non-semantic browse/enumerate within a single namespace.
+   *
+   * Unlike `search()`, this makes no embedding call and returns the public
+   * `Memory` type (no `distance`). Use it for admin/inspection/export:
+   * "show me everything in user:123", "the 20 most recently updated
+   * preferences", etc.
+   *
+   * Nullable order columns (`importance`, `lastMentionedAt`) always sort NULLS
+   * LAST regardless of direction. Ties break on `id ASC` for deterministic
+   * ordering. Pagination is offset-based.
+   *
+   * @param namespace - Isolation key to enumerate within (falls back to default)
+   * @param options - Filter, ordering, and pagination options
+   * @returns Array of memories (public `Memory` shape)
+   */
+  async list(
+    namespace: string | undefined,
+    options?: ListOptions
+  ): Promise<Memory[]> {
+    const ns = this.resolveNamespace(namespace)
+
+    try {
+      const conditions: Sql[] = [
+        sql`namespace = ${ns}`,
+        ...this.buildFilterConditions({
+          types: options?.types,
+          tags: options?.tags,
+          minImportance: options?.minImportance,
+          source: options?.source,
+          includeExpired: options?.includeExpired,
+        }),
+      ]
+      const whereClause = sqlJoin(conditions, ' AND ')
+
+      // ORDER BY column names cannot be parameterized — map through an explicit
+      // allowlist to fixed fragments. Never interpolate the caller's string.
+      const ORDER_COLUMNS: Record<string, Sql> = {
+        createdAt: sql`"createdAt"`,
+        updatedAt: sql`"updatedAt"`,
+        importance: sql`importance`,
+        lastMentionedAt: sql`"lastMentionedAt"`,
+      }
+      const orderColumn = ORDER_COLUMNS[options?.orderBy ?? 'createdAt'] ?? ORDER_COLUMNS.createdAt
+      const orderDir = options?.direction === 'asc' ? sql`ASC` : sql`DESC`
+      const orderClause = sql`${orderColumn} ${orderDir} NULLS LAST, id ASC`
+
+      // Shared with the mock so clamping cannot drift between the two
+      const { limit, offset } = resolveListPagination(options)
+
+      // Explicit column list — never SELECT * (embedding is Unsupported(...) and
+      // would drag a 1536-float vector per row across the wire).
+      const results = await this.prisma.$queryRaw<Memory[]>`
+        SELECT id, namespace, content, type, tags, source, importance,
+          "expiresAt", "lastMentionedAt", "mentionCount", "createdAt", "updatedAt"
+        FROM "Memory"
+        WHERE ${whereClause}
+        ORDER BY ${orderClause}
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `
+
+      // Rows are already in the public Memory shape — return directly.
+      return results
+    } catch (error) {
+      throw new DatabaseError('list', error instanceof Error ? error : undefined)
     }
   }
 
@@ -289,6 +500,133 @@ export class MemoryService {
     } catch (error) {
       if (error instanceof NotFoundError) throw error
       throw new DatabaseError('update', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Update a memory's content with re-embedding, and optionally update metadata.
+   * Preserves createdAt. Does not touch mentionCount or lastMentionedAt.
+   *
+   * @param id - The memory ID
+   * @param content - New content text (will be re-embedded)
+   * @param metadata - Optional metadata fields to update
+   * @returns The updated memory
+   * @throws NotFoundError if memory doesn't exist
+   */
+  async updateContent(
+    id: string,
+    content: string,
+    metadata?: MemoryUpdate
+  ): Promise<Memory> {
+    try {
+      const existing = await this.prisma.memory.findUnique({ where: { id } })
+      if (!existing) {
+        throw new NotFoundError(id)
+      }
+
+      const truncatedContent = this.truncateContent(content)
+      const embedding = await this.generateEmbedding(truncatedContent)
+      const embeddingStr = `[${embedding.join(',')}]`
+
+      // Build SET clauses dynamically
+      const setClauses: Sql[] = [
+        sql`content = ${truncatedContent}`,
+        sql`embedding = ${embeddingStr}::vector`,
+        sql`"updatedAt" = NOW()`,
+      ]
+
+      if (metadata?.type !== undefined) {
+        setClauses.push(sql`type = ${metadata.type}`)
+      }
+      if (metadata?.tags !== undefined) {
+        setClauses.push(sql`tags = ${metadata.tags}::text[]`)
+      }
+      if (metadata?.importance !== undefined) {
+        setClauses.push(sql`importance = ${metadata.importance}`)
+      }
+      if (metadata?.expiresAt !== undefined) {
+        setClauses.push(sql`"expiresAt" = ${metadata.expiresAt}`)
+      }
+
+      const result = await this.prisma.$queryRaw<Memory[]>`
+        UPDATE "Memory"
+        SET ${sqlJoin(setClauses)}
+        WHERE id = ${id}
+        RETURNING id, namespace, content, type, tags, source, importance,
+          "expiresAt", "lastMentionedAt", "mentionCount", "createdAt", "updatedAt"
+      `
+
+      return result[0]
+    } catch (error) {
+      if (error instanceof NotFoundError) throw error
+      if (error instanceof EmbeddingError) throw error
+      throw new DatabaseError('updateContent', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Insert or update a memory by namespace + key.
+   * The key maps to the `source` field. If a memory with the same
+   * namespace and source exists, its content and embedding are replaced.
+   * Metadata fields use COALESCE — only provided values overwrite existing ones.
+   *
+   * @param namespace - Isolation key
+   * @param key - Deterministic identifier (stored as `source`)
+   * @param content - The text content to store/update
+   * @param metadata - Optional metadata (type, tags, importance, expiresAt)
+   * @returns The created or updated Memory object
+   */
+  async upsert(
+    namespace: string | undefined,
+    key: string,
+    content: string,
+    metadata?: Omit<MemoryMetadata, 'source'>
+  ): Promise<Memory> {
+    const ns = this.resolveNamespace(namespace)
+    const truncatedContent = this.truncateContent(content)
+
+    try {
+      const embedding = await this.generateEmbedding(truncatedContent)
+      const embeddingStr = `[${embedding.join(',')}]`
+
+      const result = await this.prisma.$queryRaw<Memory[]>`
+        INSERT INTO "Memory" (
+          id, namespace, content, embedding, type, tags, source,
+          importance, "expiresAt", "lastMentionedAt", "mentionCount",
+          "createdAt", "updatedAt"
+        )
+        VALUES (
+          gen_random_uuid()::text,
+          ${ns},
+          ${truncatedContent},
+          ${embeddingStr}::vector,
+          ${metadata?.type ?? null},
+          ${metadata?.tags ?? []},
+          ${key},
+          ${metadata?.importance ?? null},
+          ${metadata?.expiresAt ?? null},
+          NULL,
+          0,
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT (namespace, source)
+        DO UPDATE SET
+          content = EXCLUDED.content,
+          embedding = EXCLUDED.embedding,
+          type = COALESCE(EXCLUDED.type, "Memory".type),
+          tags = CASE WHEN EXCLUDED.tags = '{}' THEN "Memory".tags ELSE EXCLUDED.tags END,
+          importance = COALESCE(EXCLUDED.importance, "Memory".importance),
+          "expiresAt" = COALESCE(EXCLUDED."expiresAt", "Memory"."expiresAt"),
+          "updatedAt" = NOW()
+        RETURNING id, namespace, content, type, tags, source, importance,
+          "expiresAt", "lastMentionedAt", "mentionCount", "createdAt", "updatedAt"
+      `
+
+      return result[0]
+    } catch (error) {
+      if (error instanceof EmbeddingError) throw error
+      throw new DatabaseError('upsert', error instanceof Error ? error : undefined)
     }
   }
 
@@ -442,6 +780,117 @@ export class MemoryService {
   }
 
   /**
+   * List distinct namespaces, optionally filtered by prefix.
+   *
+   * @param prefix - Optional prefix to filter namespaces (e.g., 'user:wes:')
+   * @returns Array of namespace strings, sorted alphabetically
+   */
+  async listNamespaces(prefix?: string): Promise<string[]> {
+    try {
+      if (prefix) {
+        const likePattern = `${prefix}%`
+        const results = await this.prisma.$queryRaw<{ namespace: string }[]>`
+          SELECT DISTINCT namespace
+          FROM "Memory"
+          WHERE namespace LIKE ${likePattern}
+          ORDER BY namespace
+        `
+        return results.map((r) => r.namespace)
+      } else {
+        const results = await this.prisma.$queryRaw<{ namespace: string }[]>`
+          SELECT DISTINCT namespace
+          FROM "Memory"
+          ORDER BY namespace
+        `
+        return results.map((r) => r.namespace)
+      }
+    } catch (error) {
+      throw new DatabaseError('listNamespaces', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Get statistics for multiple namespaces in a single set of queries.
+   *
+   * @param namespaces - Array of namespace strings
+   * @returns Map of namespace to stats
+   */
+  async getStatsMulti(namespaces: string[]): Promise<Map<string, NamespaceStats>> {
+    if (namespaces.length === 0) return new Map()
+
+    try {
+      const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
+      // Single grouped query for counts and date ranges
+      const rawStats = await this.prisma.$queryRaw<Array<{
+        namespace: string
+        total: bigint
+        oldest: Date | null
+        newest: Date | null
+        expiring: bigint
+      }>>`
+        SELECT
+          namespace,
+          COUNT(*) as total,
+          MIN("createdAt") as oldest,
+          MAX("createdAt") as newest,
+          COUNT(*) FILTER (WHERE "expiresAt" < ${sevenDaysFromNow}) as expiring
+        FROM "Memory"
+        WHERE namespace IN (${sqlJoin(namespaces)})
+        GROUP BY namespace
+      `
+
+      // Get type breakdowns per namespace
+      const typeStats = await this.prisma.$queryRaw<Array<{
+        namespace: string
+        type: string | null
+        count: bigint
+      }>>`
+        SELECT namespace, type, COUNT(*) as count
+        FROM "Memory"
+        WHERE namespace IN (${sqlJoin(namespaces)})
+        GROUP BY namespace, type
+      `
+
+      // Assemble results — initialize all requested namespaces
+      const result = new Map<string, NamespaceStats>()
+      for (const ns of namespaces) {
+        result.set(ns, {
+          totalMemories: 0,
+          byType: {},
+          oldestMemory: null,
+          newestMemory: null,
+          expiringWithin7Days: 0,
+        })
+      }
+
+      // Fill from raw stats
+      for (const row of rawStats) {
+        const stats = result.get(row.namespace)
+        if (stats) {
+          stats.totalMemories = Number(row.total)
+          stats.oldestMemory = row.oldest
+          stats.newestMemory = row.newest
+          stats.expiringWithin7Days = Number(row.expiring)
+        }
+      }
+
+      // Fill type breakdowns
+      for (const row of typeStats) {
+        const stats = result.get(row.namespace)
+        if (stats) {
+          const key = row.type ?? 'null'
+          stats.byType[key] = Number(row.count)
+        }
+      }
+
+      return result
+    } catch (error) {
+      throw new DatabaseError('getStatsMulti', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
    * Resolve namespace, using default if not provided.
    */
   private resolveNamespace(namespace: string | undefined): string {
@@ -466,7 +915,7 @@ export class MemoryService {
    * Generate embedding for a single text.
    */
   private async generateEmbedding(text: string): Promise<number[]> {
-    const embeddings = await this.generateEmbeddings([text])
+    const embeddings = await this.embeddingProvider.generateEmbeddings([text])
     return embeddings[0]
   }
 
@@ -474,37 +923,6 @@ export class MemoryService {
    * Generate embeddings for multiple texts in batch.
    */
   private async generateEmbeddings(texts: string[]): Promise<number[][]> {
-    try {
-      const response = await fetch('https://api.openai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.embeddingApiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.embeddingModel,
-          input: texts,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new EmbeddingError(`OpenAI API error: ${response.status} - ${errorText}`)
-      }
-
-      const data = (await response.json()) as {
-        data: Array<{ embedding: number[]; index: number }>
-      }
-
-      // Sort by index to maintain order
-      const sorted = data.data.sort((a, b) => a.index - b.index)
-      return sorted.map((d) => d.embedding)
-    } catch (error) {
-      if (error instanceof EmbeddingError) throw error
-      throw new EmbeddingError(
-        'Failed to generate embedding',
-        error instanceof Error ? error : undefined
-      )
-    }
+    return this.embeddingProvider.generateEmbeddings(texts)
   }
 }

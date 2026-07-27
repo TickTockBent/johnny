@@ -1,15 +1,19 @@
+import type { EmbeddingProvider } from './EmbeddingProvider'
+
 /**
  * Configuration options for initializing MemoryService
  */
 export interface MemoryServiceOptions {
   /** Your application's Prisma client instance */
   prisma: PrismaClientLike
-  /** OpenAI API key for generating embeddings */
-  embeddingApiKey: string
-  /** Embedding model to use (default: text-embedding-3-small) */
+  /** OpenAI API key for generating embeddings (not needed if embeddingProvider is set) */
+  embeddingApiKey?: string
+  /** Embedding model to use (default: text-embedding-3-small, not needed if embeddingProvider is set) */
   embeddingModel?: string
   /** Default namespace if not specified per-call */
   defaultNamespace?: string
+  /** Custom embedding provider. Takes precedence over embeddingApiKey/embeddingModel. */
+  embeddingProvider?: EmbeddingProvider
 }
 
 /**
@@ -161,6 +165,40 @@ export interface SearchOptions {
   excludeMentionedWithin?: number
   /** Filter by minimum importance threshold */
   minImportance?: number
+  /** Optional time-based relevance decay for ordering */
+  decayOptions?: DecayOptions
+}
+
+/**
+ * Options for non-semantic browse/enumerate via `list()`.
+ *
+ * Reuses the filter vocabulary of {@link SearchOptions} so the two feel like
+ * siblings. Unlike `search()`, there is no query and no embedding call — this
+ * is an admin/inspection/export path.
+ */
+export interface ListOptions {
+  /** Filter to specific types (`type IN (...)`) */
+  types?: string[]
+  /** Filter to memories with ALL of these tags (ALL-of, same as search) */
+  tags?: string[]
+  /** Filter by minimum importance threshold (rows with null importance excluded) */
+  minImportance?: number
+  /** Filter by exact source match (useful given `source` is the upsert key) */
+  source?: string
+  /** Include expired memories (default: false — expired rows are excluded) */
+  includeExpired?: boolean
+  /**
+   * Column to order by (default: 'createdAt').
+   * `importance` and `lastMentionedAt` are nullable; NULLs always sort LAST
+   * regardless of direction (overriding Postgres's default NULLS FIRST on DESC).
+   */
+  orderBy?: 'createdAt' | 'updatedAt' | 'importance' | 'lastMentionedAt'
+  /** Sort direction (default: 'desc') */
+  direction?: 'asc' | 'desc'
+  /** Max results (default: 50, clamped to a maximum of 1000) */
+  limit?: number
+  /** Offset for pagination (default: 0) */
+  offset?: number
 }
 
 /**
@@ -176,6 +214,7 @@ export interface MemorySearchResult {
   /** Semantic distance (lower = more similar) */
   distance: number
   createdAt: Date
+  updatedAt: Date
   lastMentionedAt: Date | null
   mentionCount: number
 }
@@ -203,6 +242,53 @@ export interface RawSearchResult {
   importance: number | null
   distance: number
   createdAt: Date
+  updatedAt: Date
   lastMentionedAt: Date | null
   mentionCount: number
+}
+
+/**
+ * Shared interface for MemoryService and MockMemoryService.
+ * Ensures both implementations stay in sync.
+ */
+/**
+ * Search result from multi-namespace search.
+ * Extends MemorySearchResult with required namespace field.
+ */
+export interface CrossNamespaceSearchResult extends MemorySearchResult {
+  namespace: string
+}
+
+/**
+ * Options for time-based relevance decay.
+ */
+export interface DecayOptions {
+  /** Number of hours for importance to decay to 50%. */
+  halfLifeHours: number
+  /** If true, decay clock resets from lastMentionedAt instead of createdAt. Default: false. */
+  reinforceOnMention?: boolean
+}
+
+/**
+ * Shared interface for MemoryService and MockMemoryService.
+ * Ensures both implementations stay in sync.
+ */
+export interface IMemoryService {
+  store(namespace: string | undefined, content: string, metadata?: MemoryMetadata): Promise<Memory>
+  storeMany(namespace: string | undefined, items: CreateMemory[]): Promise<Memory[]>
+  search(namespace: string | undefined, query: string, options?: SearchOptions): Promise<MemorySearchResult[]>
+  searchAcross(namespaces: string[], query: string, options?: SearchOptions): Promise<CrossNamespaceSearchResult[]>
+  list(namespace: string | undefined, options?: ListOptions): Promise<Memory[]>
+  get(id: string): Promise<Memory | null>
+  update(id: string, updates: MemoryUpdate): Promise<Memory>
+  updateContent(id: string, content: string, metadata?: MemoryUpdate): Promise<Memory>
+  upsert(namespace: string | undefined, key: string, content: string, metadata?: Omit<MemoryMetadata, 'source'>): Promise<Memory>
+  delete(id: string): Promise<void>
+  recordMention(id: string): Promise<void>
+  deleteByNamespace(namespace: string): Promise<number>
+  deleteBySource(namespace: string, source: string): Promise<number>
+  pruneExpired(): Promise<number>
+  getStats(namespace: string): Promise<NamespaceStats>
+  listNamespaces(prefix?: string): Promise<string[]>
+  getStatsMulti(namespaces: string[]): Promise<Map<string, NamespaceStats>>
 }

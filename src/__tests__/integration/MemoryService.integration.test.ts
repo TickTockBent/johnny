@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { MemoryService } from '../../MemoryService'
+import { MockMemoryService } from '../../MockMemoryService'
+import type { IMemoryService, ListOptions } from '../../types'
 import { NotFoundError, NamespaceRequiredError } from '../../errors'
 import { setupIntegrationTests } from './setup'
 
@@ -337,18 +339,19 @@ describe('MemoryService Integration', () => {
 
   describe('deleteBySource()', () => {
     it('deletes memories by namespace and source', async () => {
-      const service = createService('test')
+      const service = createService()
 
-      await service.store(undefined, 'A', { source: 'doc:1' })
-      await service.store(undefined, 'B', { source: 'doc:1' })
-      await service.store(undefined, 'C', { source: 'doc:2' })
+      // (namespace, source) is unique, so use different namespaces
+      await service.store('ns1', 'A', { source: 'doc:1' })
+      await service.store('ns2', 'B', { source: 'doc:1' })
+      await service.store('ns1', 'C', { source: 'doc:2' })
 
-      const count = await service.deleteBySource('test', 'doc:1')
+      const count = await service.deleteBySource('ns1', 'doc:1')
 
-      expect(count).toBe(2)
+      expect(count).toBe(1)
 
       const remaining = await prisma.memory.count()
-      expect(remaining).toBe(1)
+      expect(remaining).toBe(2)
     })
   })
 
@@ -408,6 +411,251 @@ describe('MemoryService Integration', () => {
     })
   })
 
+  describe('search() with updatedAt', () => {
+    it('includes updatedAt in search results', async () => {
+      const service = createService('test')
+      await service.store(undefined, 'Hello world')
+
+      const results = await service.search(undefined, 'Hello world', { maxDistance: 0.9 })
+
+      expect(results.length).toBeGreaterThan(0)
+      expect(results[0].updatedAt).toBeInstanceOf(Date)
+    })
+  })
+
+  describe('embedding provider', () => {
+    it('works with custom embeddingProvider', async () => {
+      // Create a service with a custom provider instead of embeddingApiKey
+      const { OpenAIEmbeddingProvider } = await import('../../EmbeddingProvider')
+      const provider = new OpenAIEmbeddingProvider({ apiKey: 'mock-key' })
+      const service = new MemoryService({ prisma, embeddingProvider: provider })
+
+      const memory = await service.store('test', 'Hello with provider')
+      expect(memory.content).toBe('Hello with provider')
+
+      const results = await service.search('test', 'Hello', { maxDistance: 0.9 })
+      expect(results.length).toBeGreaterThan(0)
+    })
+
+    it('throws when neither provider nor key is given', () => {
+      expect(() => new MemoryService({ prisma } as any)).toThrow(
+        'Either embeddingProvider or embeddingApiKey must be provided'
+      )
+    })
+  })
+
+  describe('updateContent()', () => {
+    it('updates content and re-embeds', async () => {
+      const service = createService('test')
+      const original = await service.store(undefined, 'Original content')
+
+      const updated = await service.updateContent(original.id, 'New updated content')
+
+      expect(updated.id).toBe(original.id)
+      expect(updated.content).toBe('New updated content')
+      expect(updated.createdAt).toEqual(original.createdAt)
+    })
+
+    it('applies optional metadata', async () => {
+      const service = createService('test')
+      const original = await service.store(undefined, 'Content', { type: 'fact' })
+
+      const updated = await service.updateContent(original.id, 'New content', {
+        type: 'preference',
+        importance: 0.9,
+      })
+
+      expect(updated.type).toBe('preference')
+      expect(updated.importance).toBe(0.9)
+    })
+
+    it('does not touch mentionCount or lastMentionedAt', async () => {
+      const service = createService('test')
+      const original = await service.store(undefined, 'Content')
+      await service.recordMention(original.id)
+
+      const afterMention = await service.get(original.id)
+      const updated = await service.updateContent(original.id, 'New content')
+
+      expect(updated.mentionCount).toBe(afterMention!.mentionCount)
+      expect(updated.lastMentionedAt).toEqual(afterMention!.lastMentionedAt)
+    })
+
+    it('throws NotFoundError for non-existent ID', async () => {
+      const service = createService('test')
+      await expect(
+        service.updateContent('non-existent', 'Content')
+      ).rejects.toThrow(NotFoundError)
+    })
+  })
+
+  describe('upsert()', () => {
+    it('creates a new memory when key does not exist', async () => {
+      const service = createService('test')
+      const result = await service.upsert(undefined, 'contact:john', 'John is a developer', {
+        type: 'entity',
+        importance: 0.8,
+      })
+
+      expect(result.content).toBe('John is a developer')
+      expect(result.source).toBe('contact:john')
+      expect(result.type).toBe('entity')
+      expect(result.importance).toBe(0.8)
+    })
+
+    it('updates existing memory on conflict', async () => {
+      const service = createService('test')
+      const first = await service.upsert(undefined, 'contact:john', 'John is a developer')
+      const second = await service.upsert(undefined, 'contact:john', 'John is a senior dev')
+
+      expect(second.id).toBe(first.id)
+      expect(second.content).toBe('John is a senior dev')
+      expect(second.createdAt).toEqual(first.createdAt)
+    })
+
+    it('preserves existing metadata when not provided (COALESCE)', async () => {
+      const service = createService('test')
+      await service.upsert(undefined, 'key', 'Content', {
+        type: 'entity',
+        tags: ['contact'],
+        importance: 0.8,
+      })
+
+      const updated = await service.upsert(undefined, 'key', 'New content')
+
+      expect(updated.type).toBe('entity')
+      expect(updated.tags).toEqual(['contact'])
+      expect(updated.importance).toBe(0.8)
+    })
+
+    it('does not create duplicate rows', async () => {
+      const service = createService('test')
+      await service.upsert(undefined, 'key', 'First')
+      await service.upsert(undefined, 'key', 'Second')
+      await service.upsert(undefined, 'key', 'Third')
+
+      const count = await prisma.memory.count()
+      expect(count).toBe(1)
+    })
+  })
+
+  describe('searchAcross()', () => {
+    it('returns results from multiple namespaces', async () => {
+      const service = createService()
+      await service.store('ns1', 'Coffee beans')
+      await service.store('ns2', 'Coffee machines')
+      await service.store('ns3', 'Tea leaves')
+
+      const results = await service.searchAcross(['ns1', 'ns2'], 'Coffee', {
+        maxDistance: 0.9,
+      })
+
+      expect(results.length).toBe(2)
+      expect(results.every((r) => ['ns1', 'ns2'].includes(r.namespace))).toBe(true)
+    })
+
+    it('includes namespace in results', async () => {
+      const service = createService()
+      await service.store('ns1', 'Some content')
+
+      const results = await service.searchAcross(['ns1'], 'content', { maxDistance: 0.9 })
+
+      expect(results.length).toBeGreaterThan(0)
+      expect(results[0].namespace).toBe('ns1')
+    })
+
+    it('returns empty array for empty namespaces', async () => {
+      const service = createService('test')
+      const results = await service.searchAcross([], 'query')
+      expect(results).toEqual([])
+    })
+  })
+
+  describe('search() with decayOptions', () => {
+    it('applies decay to ordering without changing raw distance', async () => {
+      const service = createService('test')
+
+      const memory = await service.store(undefined, 'Coffee beans')
+
+      // Search with decay
+      const resultsWithDecay = await service.search(undefined, 'Coffee', {
+        maxDistance: 0.9,
+        decayOptions: { halfLifeHours: 720 },
+      })
+
+      // Search without decay
+      const resultsWithout = await service.search(undefined, 'Coffee', {
+        maxDistance: 0.9,
+      })
+
+      // Raw distance should be the same
+      expect(resultsWithDecay[0].distance).toBeCloseTo(resultsWithout[0].distance, 5)
+    })
+  })
+
+  describe('listNamespaces()', () => {
+    it('returns distinct namespaces', async () => {
+      const service = createService()
+      await service.store('ns1', 'Content A')
+      await service.store('ns2', 'Content B')
+      await service.store('ns1', 'Content C')
+
+      const namespaces = await service.listNamespaces()
+
+      expect(namespaces).toContain('ns1')
+      expect(namespaces).toContain('ns2')
+      expect(namespaces.length).toBe(2)
+    })
+
+    it('filters by prefix', async () => {
+      const service = createService()
+      await service.store('user:wes:entities', 'Entity')
+      await service.store('user:wes:voice', 'Voice')
+      await service.store('user:bob:entities', 'Entity')
+
+      const namespaces = await service.listNamespaces('user:wes:')
+
+      expect(namespaces).toEqual(['user:wes:entities', 'user:wes:voice'])
+    })
+
+    it('returns empty array when no namespaces match', async () => {
+      const service = createService('test')
+      await service.store(undefined, 'Content')
+
+      const namespaces = await service.listNamespaces('nonexistent:')
+      expect(namespaces).toEqual([])
+    })
+  })
+
+  describe('getStatsMulti()', () => {
+    it('returns stats for multiple namespaces', async () => {
+      const service = createService()
+      await service.store('ns1', 'Content A', { type: 'fact' })
+      await service.store('ns1', 'Content B', { type: 'fact' })
+      await service.store('ns2', 'Content C', { type: 'event' })
+
+      const stats = await service.getStatsMulti(['ns1', 'ns2'])
+
+      expect(stats.get('ns1')!.totalMemories).toBe(2)
+      expect(stats.get('ns2')!.totalMemories).toBe(1)
+    })
+
+    it('returns empty stats for namespaces with no data', async () => {
+      const service = createService()
+      await service.store('ns1', 'Content')
+
+      const stats = await service.getStatsMulti(['ns1', 'empty-ns'])
+
+      expect(stats.get('empty-ns')!.totalMemories).toBe(0)
+    })
+
+    it('returns empty map for empty input', async () => {
+      const service = createService('test')
+      const stats = await service.getStatsMulti([])
+      expect(stats.size).toBe(0)
+    })
+  })
+
   describe('SQL injection prevention', () => {
     it('safely handles malicious namespace input', async () => {
       const service = createService()
@@ -464,6 +712,135 @@ describe('MemoryService Integration', () => {
 
       const count = await prisma.memory.count()
       expect(count).toBe(1)
+    })
+  })
+
+  describe('list()', () => {
+    // Seed identical fixtures into any IMemoryService. A small delay between
+    // stores guarantees strictly-increasing createdAt in both the real DB
+    // (NOW()) and the mock (Date.now()), so createdAt ordering is unambiguous.
+    const seed = async (service: IMemoryService, namespace: string) => {
+      await service.store(namespace, 'alpha', { type: 'fact', importance: 0.9, source: 'src-a' })
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'bravo', { type: 'note', importance: 0.5, source: 'src-b' })
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'charlie', { type: 'fact', source: 'src-c' }) // null importance
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'delta', {
+        type: 'fact',
+        importance: 0.2,
+        source: 'src-d',
+        expiresAt: new Date(Date.now() - 60_000), // expired
+      })
+    }
+
+    // Assert the real service and the mock produce the same content ordering
+    // for a given list() call — the parity guarantee behind IMemoryService.
+    const assertParity = async (namespace: string, options?: ListOptions) => {
+      const real = createService()
+      const mock = new MockMemoryService()
+      await seed(real, namespace)
+      await seed(mock, namespace)
+
+      const realResults = await real.list(namespace, options)
+      const mockResults = await mock.list(namespace, options)
+
+      expect(realResults.map((r) => r.content)).toEqual(mockResults.map((r) => r.content))
+      return realResults
+    }
+
+    it('default order (createdAt desc) matches the mock', async () => {
+      // Expired 'delta' excluded; newest-first over the remaining rows.
+      const results = await assertParity('parity')
+      expect(results.map((r) => r.content)).toEqual(['charlie', 'bravo', 'alpha'])
+    })
+
+    it('orderBy importance desc puts the null-importance row last (NULLS LAST)', async () => {
+      const results = await assertParity('parity', { orderBy: 'importance', direction: 'desc' })
+      expect(results.map((r) => r.content)).toEqual(['alpha', 'bravo', 'charlie'])
+      expect(results[results.length - 1].importance).toBeNull()
+    })
+
+    it('orderBy importance asc keeps the null row last', async () => {
+      const results = await assertParity('parity', { orderBy: 'importance', direction: 'asc' })
+      expect(results.map((r) => r.content)).toEqual(['bravo', 'alpha', 'charlie'])
+    })
+
+    it('source filter matches the mock', async () => {
+      const results = await assertParity('parity', { source: 'src-a' })
+      expect(results.map((r) => r.content)).toEqual(['alpha'])
+    })
+
+    it('includeExpired includes the expired row', async () => {
+      const results = await assertParity('parity', {
+        includeExpired: true,
+        orderBy: 'importance',
+        direction: 'asc',
+      })
+      expect(results.map((r) => r.content)).toEqual(['delta', 'bravo', 'alpha', 'charlie'])
+    })
+
+    it('offset/limit paging matches the mock', async () => {
+      const results = await assertParity('parity', {
+        orderBy: 'importance',
+        direction: 'desc',
+        limit: 2,
+        offset: 1,
+      })
+      expect(results.map((r) => r.content)).toEqual(['bravo', 'charlie'])
+    })
+
+    it('non-finite limit falls back to the default instead of unbounding the query', async () => {
+      // Regression: NaN survived the old Math.min/Math.max clamp, serialized to
+      // SQL NULL, and Postgres read `LIMIT NULL` as no limit — returning the
+      // whole namespace. Seed past the default so a bypass is visible.
+      const service = createService()
+      await service.storeMany(
+        'unbounded',
+        Array.from({ length: 60 }, (_, index) => ({ content: `row-${index}` }))
+      )
+
+      expect(await service.list('unbounded', { limit: NaN })).toHaveLength(50)
+      expect(await service.list('unbounded', { offset: NaN })).toHaveLength(50)
+      expect(await service.list('unbounded', { offset: Infinity })).toHaveLength(50)
+    })
+
+    it('fractional limit truncates identically to the mock', async () => {
+      const results = await assertParity('parity', {
+        orderBy: 'importance',
+        direction: 'desc',
+        limit: 2.9,
+      })
+      expect(results.map((r) => r.content)).toEqual(['alpha', 'bravo'])
+    })
+
+    it('returns public Memory rows with namespace and no distance/embedding', async () => {
+      const service = createService()
+      await seed(service, 'shape')
+
+      const results = await service.list('shape')
+
+      expect(results.length).toBeGreaterThan(0)
+      for (const row of results) {
+        expect(row.namespace).toBe('shape')
+        expect(row).not.toHaveProperty('distance')
+        expect(row).not.toHaveProperty('embedding')
+      }
+    })
+
+    it('uses the default namespace and scopes to it', async () => {
+      const service = createService('default-list-ns')
+      await service.store(undefined, 'in-default')
+      await service.store('other-ns', 'elsewhere')
+
+      const results = await service.list(undefined)
+
+      expect(results.map((r) => r.content)).toEqual(['in-default'])
+    })
+
+    it('throws NamespaceRequiredError with no default and undefined namespace', async () => {
+      const service = createService()
+      await expect(service.list(undefined)).rejects.toThrow(NamespaceRequiredError)
     })
   })
 })

@@ -6,13 +6,18 @@ Johnny provides the **retrieval** layer for RAG (Retrieval-Augmented Generation)
 
 ## Features
 
-- **Vector embeddings** via OpenAI's `text-embedding-3-small` (1536 dimensions)
+- **Vector embeddings** via OpenAI's `text-embedding-3-small` (1536 dimensions) or any custom provider
 - **PostgreSQL + pgvector** for storage and similarity search
 - **Namespace isolation** - separate memory spaces per user, project, or context
+- **Cross-namespace search** - search across multiple namespaces in one call
 - **Flexible filtering** - by type, tags, importance, recency
+- **Relevance decay** - time-based decay with configurable half-life
+- **Upsert support** - atomic insert-or-update by key with metadata preservation
+- **Content re-embedding** - update content and automatically regenerate embeddings
 - **Usage tracking** - mention counts and cooldowns to avoid repetition
 - **TTL expiration** - automatic cleanup of stale memories
 - **Prisma integration** - works with your existing Prisma client
+- **IMemoryService interface** - shared contract for real and mock implementations
 
 ## Installation
 
@@ -72,10 +77,12 @@ model Memory {
 
   @@index([namespace])
   @@index([namespace, type])
-  @@index([namespace, source])
+  @@unique([namespace, source])
   @@index([expiresAt])
 }
 ```
+
+> **Note:** The `@@unique([namespace, source])` constraint is required for `upsert()` to work. If upgrading from v0.2.0, see the [Migration Guide](MIGRATION.md).
 
 ### 2. Set up the database
 
@@ -119,17 +126,53 @@ console.log(results[0].content)   // "User loves hiking in the mountains"
 console.log(results[0].distance)  // 0.42
 ```
 
+## Custom Embedding Providers
+
+By default Johnny uses OpenAI, but you can supply any embedding provider:
+
+```typescript
+import { MemoryService, OpenAIEmbeddingProvider } from '@ticktockbent/johnny'
+import type { EmbeddingProvider } from '@ticktockbent/johnny'
+
+// Use the built-in OpenAI provider explicitly
+const openai = new OpenAIEmbeddingProvider({
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'text-embedding-3-small',  // default
+  dimensions: 1536,                  // default
+})
+
+// Or implement your own
+const customProvider: EmbeddingProvider = {
+  dimensions: 768,
+  async generateEmbeddings(texts: string[]): Promise<number[][]> {
+    // Call Ollama, Cohere, a local model, etc.
+    return texts.map(text => computeEmbedding(text))
+  },
+}
+
+const memory = new MemoryService({
+  prisma,
+  embeddingProvider: customProvider,
+  defaultNamespace: 'my-app',
+})
+```
+
+> **Note:** The vector dimension in your Prisma schema (`vector(1536)`) must match your provider's `dimensions` value. See `prisma/memory.prisma` for common dimension values.
+
 ## API Reference
 
 ### `MemoryService`
+
+Both `MemoryService` and `MockMemoryService` implement the `IMemoryService` interface.
 
 #### Constructor
 
 ```typescript
 new MemoryService({
   prisma: PrismaClient,           // Your Prisma client instance
-  embeddingApiKey: string,        // OpenAI API key
+  embeddingApiKey?: string,       // OpenAI API key (not needed if embeddingProvider is set)
   embeddingModel?: string,        // Default: 'text-embedding-3-small'
+  embeddingProvider?: EmbeddingProvider,  // Custom embedding provider (takes precedence)
   defaultNamespace?: string,      // Optional default namespace
 })
 ```
@@ -141,7 +184,7 @@ new MemoryService({
 Store a new memory with auto-generated embedding.
 
 ```typescript
-const memory = await memory.store('user:123', 'Content to remember', {
+const memory = await service.store('user:123', 'Content to remember', {
   type: 'fact',              // App-defined category
   tags: ['tag1', 'tag2'],    // Flexible labels for filtering
   source: 'conversation:456', // Origin reference
@@ -152,10 +195,10 @@ const memory = await memory.store('user:123', 'Content to remember', {
 
 ##### `storeMany(namespace, items[])`
 
-Batch store multiple memories (more efficient for bulk operations).
+Batch store multiple memories using an efficient multi-row INSERT.
 
 ```typescript
-const memories = await memory.storeMany('user:123', [
+const memories = await service.storeMany('user:123', [
   { content: 'First fact', metadata: { type: 'fact' } },
   { content: 'Second fact', metadata: { type: 'fact' } },
 ])
@@ -166,25 +209,70 @@ const memories = await memory.storeMany('user:123', [
 Find memories semantically similar to a query.
 
 ```typescript
-const results = await memory.search('user:123', 'search query', {
+const results = await service.search('user:123', 'search query', {
   limit: 10,                    // Max results (default: 10)
   maxDistance: 0.5,             // Similarity threshold (default: 0.5, lower = stricter)
   types: ['fact', 'preference'], // Filter by type
   tags: ['important'],          // Must have ALL these tags
   minImportance: 0.5,           // Minimum importance score
   excludeMentionedWithin: 24,   // Exclude if mentioned within N hours
+  decayOptions: {               // Optional time-based relevance decay
+    halfLifeHours: 168,         // Half-life in hours (168 = 1 week)
+    reinforceOnMention: true,   // Reset decay clock on mention
+  },
 })
 
 // Returns MemorySearchResult[]
-// { id, content, type, tags, source, importance, distance, createdAt, lastMentionedAt, mentionCount }
+// { id, content, type, tags, source, importance, distance, createdAt, updatedAt, lastMentionedAt, mentionCount }
 ```
+
+##### `searchAcross(namespaces, query, options?)`
+
+Search across multiple namespaces in a single call. Results include the `namespace` field.
+
+```typescript
+const results = await service.searchAcross(
+  ['user:123', 'shared', 'global'],
+  'search query',
+  { limit: 10 }
+)
+
+// Returns CrossNamespaceSearchResult[] (MemorySearchResult + namespace)
+console.log(results[0].namespace)  // "shared"
+console.log(results[0].content)    // "Some shared memory"
+```
+
+##### `list(namespace, options?)`
+
+Non-semantic browse/enumerate within a single namespace. Unlike `search()`, this makes **no embedding call** and takes **no query** — use it for admin/inspection/export (e.g. "show me everything in `user:123`", "the 20 most recently updated `preference` memories"). Returns the public `Memory[]` type (has `namespace`, **no** `distance`).
+
+```typescript
+const memories = await service.list('user:123', {
+  types: ['preference'],   // Filter by type (type IN ...)
+  tags: ['important'],     // Must have ALL these tags
+  minImportance: 0.5,      // Minimum importance (rows with null importance excluded)
+  source: 'doc:42',        // Exact source match (source is the upsert key)
+  includeExpired: false,   // Include expired rows (default: false)
+  orderBy: 'createdAt',    // 'createdAt' | 'updatedAt' | 'importance' | 'lastMentionedAt' (default: 'createdAt')
+  direction: 'desc',       // 'asc' | 'desc' (default: 'desc')
+  limit: 50,               // Max results (default: 50, clamped to 1000)
+  offset: 0,               // Offset for pagination (default: 0)
+})
+
+// Returns Memory[]
+// { id, namespace, content, type, tags, source, importance, expiresAt, lastMentionedAt, mentionCount, createdAt, updatedAt }
+```
+
+**Ordering:** `importance` and `lastMentionedAt` are nullable; NULLs always sort **last** regardless of direction (overriding Postgres's default of NULLS FIRST on DESC). Ties break on `id` ascending for deterministic ordering.
+
+**Pagination:** offset-based (intended for an admin/export path, not a hot loop). `limit` is clamped to 1000 and non-finite values (`NaN`, `Infinity`) fall back to the default, so a stray `parseInt()` can't turn a page request into a full-namespace scan. There is no total-count companion: `getStats(namespace).totalMemories` counts *every* row in the namespace — including expired ones — and ignores the filters above, so it is only a valid page count for an unfiltered list with no expired rows.
 
 ##### `get(id)`
 
 Retrieve a specific memory by ID.
 
 ```typescript
-const memory = await memory.get('memory-id')
+const memory = await service.get('memory-id')
 ```
 
 ##### `update(id, updates)`
@@ -192,7 +280,7 @@ const memory = await memory.get('memory-id')
 Update a memory's metadata (does not re-embed content).
 
 ```typescript
-const updated = await memory.update('memory-id', {
+const updated = await service.update('memory-id', {
   type: 'new-type',
   tags: ['new', 'tags'],
   importance: 0.9,
@@ -200,12 +288,37 @@ const updated = await memory.update('memory-id', {
 })
 ```
 
+##### `updateContent(id, content, metadata?)`
+
+Update a memory's content and automatically regenerate its embedding. Optionally update metadata at the same time.
+
+```typescript
+const updated = await service.updateContent('memory-id', 'New content text', {
+  importance: 0.9,
+})
+```
+
+##### `upsert(namespace, key, content, metadata?)`
+
+Atomic insert-or-update using the `source` field as the unique key within a namespace. If a memory with the same `(namespace, source)` pair exists, its content and embedding are updated. Metadata fields use COALESCE semantics — only explicitly provided fields are overwritten; omitted fields preserve their existing values.
+
+```typescript
+// First call creates the memory
+await service.upsert('user:123', 'user-bio', 'Likes hiking', {
+  type: 'preference',
+  importance: 0.8,
+})
+
+// Second call updates content + embedding, preserves importance
+await service.upsert('user:123', 'user-bio', 'Likes hiking and kayaking')
+```
+
 ##### `delete(id)`
 
 Delete a specific memory.
 
 ```typescript
-await memory.delete('memory-id')
+await service.delete('memory-id')
 ```
 
 ##### `recordMention(id)`
@@ -213,7 +326,7 @@ await memory.delete('memory-id')
 Track that a memory was used. Updates `lastMentionedAt` and increments `mentionCount`.
 
 ```typescript
-await memory.recordMention('memory-id')
+await service.recordMention('memory-id')
 ```
 
 ##### `deleteByNamespace(namespace)`
@@ -221,15 +334,15 @@ await memory.recordMention('memory-id')
 Delete all memories in a namespace.
 
 ```typescript
-const count = await memory.deleteByNamespace('user:123')
+const count = await service.deleteByNamespace('user:123')
 ```
 
 ##### `deleteBySource(namespace, source)`
 
-Delete all memories from a specific source.
+Delete all memories from a specific source within a namespace.
 
 ```typescript
-const count = await memory.deleteBySource('user:123', 'document:456')
+const count = await service.deleteBySource('user:123', 'document:456')
 ```
 
 ##### `pruneExpired()`
@@ -237,7 +350,7 @@ const count = await memory.deleteBySource('user:123', 'document:456')
 Delete all memories past their `expiresAt` timestamp.
 
 ```typescript
-const count = await memory.pruneExpired()
+const count = await service.pruneExpired()
 ```
 
 ##### `getStats(namespace)`
@@ -245,8 +358,31 @@ const count = await memory.pruneExpired()
 Get statistics for a namespace.
 
 ```typescript
-const stats = await memory.getStats('user:123')
+const stats = await service.getStats('user:123')
 // { totalMemories, byType, oldestMemory, newestMemory, expiringWithin7Days }
+```
+
+##### `listNamespaces(prefix?)`
+
+List all distinct namespaces, optionally filtered by prefix.
+
+```typescript
+const all = await service.listNamespaces()
+// ['global', 'user:123', 'user:456']
+
+const userOnly = await service.listNamespaces('user:')
+// ['user:123', 'user:456']
+```
+
+##### `getStatsMulti(namespaces)`
+
+Get statistics for multiple namespaces in a single call.
+
+```typescript
+const statsMap = await service.getStatsMulti(['user:123', 'user:456'])
+// Map<string, NamespaceStats>
+
+statsMap.get('user:123')?.totalMemories  // 42
 ```
 
 ## Testing
@@ -262,7 +398,7 @@ const memory = new MockMemoryService({
   defaultNamespace: 'test',
 })
 
-// Same API as MemoryService
+// Same API as MemoryService (both implement IMemoryService)
 await memory.store(undefined, 'Test content')
 const results = await memory.search(undefined, 'test')
 
@@ -279,7 +415,7 @@ Johnny exports typed errors for specific failure cases:
 ```typescript
 import {
   MemoryError,           // Base error class
-  EmbeddingError,        // OpenAI API failures
+  EmbeddingError,        // Embedding provider failures
   NotFoundError,         // Memory not found
   NamespaceRequiredError, // Missing namespace
   DatabaseError,         // Database operation failures
