@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-27
+
+### Added
+- **`list(namespace, options?)`** - Non-semantic browse/enumerate within a namespace. Returns `Memory[]` (no embedding call, no query, no `distance`) for admin/inspection/export use cases. Supports the familiar filter vocabulary (`types`, `tags` ALL-of, `minImportance`, plus a new `source` exact-match filter and `includeExpired`), ordering by `createdAt`/`updatedAt`/`importance`/`lastMentionedAt` (NULLS LAST, `id` tiebreak) in either direction, and offset-based pagination (`limit` default 50, clamped to 1000; `offset` default 0). Non-finite pagination input (`NaN`, `Infinity`) falls back to the default rather than reaching Postgres as `LIMIT NULL`, which would return the entire namespace; fractional values are truncated. Additive — no schema migration.
+- New exported type: `ListOptions`
+
+### Changed
+- Internal: extracted a shared `buildFilterConditions()` helper in `MemoryService` used by `search()`, `searchAcross()`, and `list()` to keep filter semantics identical across all read paths (no behavioral change to existing methods)
+- Internal: new `src/pagination.ts` holds the `list()` pagination defaults and sanitization, imported by both `MemoryService` and `MockMemoryService` so the clamping the mock's parity guarantee depends on cannot drift between them
+
 ## [0.3.0] - 2026-02-07
 
 ### Added

@@ -7,6 +7,7 @@ import type {
   MemoryUpdate,
   CreateMemory,
   SearchOptions,
+  ListOptions,
   MemorySearchResult,
   CrossNamespaceSearchResult,
   NamespaceStats,
@@ -15,6 +16,7 @@ import type {
 } from './types'
 import type { EmbeddingProvider } from './EmbeddingProvider'
 import { OpenAIEmbeddingProvider } from './EmbeddingProvider'
+import { resolveListPagination } from './pagination'
 import {
   EmbeddingError,
   NotFoundError,
@@ -207,34 +209,12 @@ export class MemoryService implements IMemoryService {
       const embedding = await this.generateEmbedding(query)
       const embeddingStr = `[${embedding.join(',')}]`
 
-      // Build WHERE conditions using sql tagged template for safe parameterization
+      // Build WHERE conditions using sql tagged template for safe parameterization.
+      // Namespace scoping stays inline; the shared filters come from the helper.
       const conditions: Sql[] = [
         sql`namespace = ${ns}`,
+        ...this.buildFilterConditions(options),
       ]
-
-      if (options?.types?.length) {
-        // Use sqlJoin for safe IN clause
-        conditions.push(sql`type IN (${sqlJoin(options.types)})`)
-      }
-
-      if (options?.tags?.length) {
-        // PostgreSQL array containment - cast the parameter array to text[]
-        conditions.push(sql`tags @> ${options.tags}::text[]`)
-      }
-
-      if (options?.minImportance !== undefined) {
-        conditions.push(sql`importance >= ${options.minImportance}`)
-      }
-
-      if (options?.excludeMentionedWithin !== undefined) {
-        const hoursAgo = new Date(Date.now() - options.excludeMentionedWithin * 60 * 60 * 1000)
-        conditions.push(
-          sql`("lastMentionedAt" IS NULL OR "lastMentionedAt" < ${hoursAgo})`
-        )
-      }
-
-      // Exclude expired memories
-      conditions.push(sql`("expiresAt" IS NULL OR "expiresAt" > NOW())`)
 
       // Join all conditions with AND using sqlJoin
       const whereClause = sqlJoin(conditions, ' AND ')
@@ -309,28 +289,8 @@ export class MemoryService implements IMemoryService {
 
       const conditions: Sql[] = [
         sql`namespace IN (${sqlJoin(namespaces)})`,
+        ...this.buildFilterConditions(options),
       ]
-
-      if (options?.types?.length) {
-        conditions.push(sql`type IN (${sqlJoin(options.types)})`)
-      }
-
-      if (options?.tags?.length) {
-        conditions.push(sql`tags @> ${options.tags}::text[]`)
-      }
-
-      if (options?.minImportance !== undefined) {
-        conditions.push(sql`importance >= ${options.minImportance}`)
-      }
-
-      if (options?.excludeMentionedWithin !== undefined) {
-        const hoursAgo = new Date(Date.now() - options.excludeMentionedWithin * 60 * 60 * 1000)
-        conditions.push(
-          sql`("lastMentionedAt" IS NULL OR "lastMentionedAt" < ${hoursAgo})`
-        )
-      }
-
-      conditions.push(sql`("expiresAt" IS NULL OR "expiresAt" > NOW())`)
 
       const whereClause = sqlJoin(conditions, ' AND ')
 
@@ -375,6 +335,127 @@ export class MemoryService implements IMemoryService {
     } catch (error) {
       if (error instanceof EmbeddingError) throw error
       throw new DatabaseError('searchAcross', error instanceof Error ? error : undefined)
+    }
+  }
+
+  /**
+   * Build the shared, non-namespace WHERE conditions used by `search()`,
+   * `searchAcross()`, and `list()`. Keeping this in one place ensures the
+   * filter semantics (type IN, tags ALL-of, minImportance, source exact match,
+   * mention recency, expiry exclusion) stay identical across all read paths.
+   *
+   * @param options - Filter options; unspecified filters are omitted
+   * @returns Array of SQL fragments to AND together with the caller's namespace clause
+   */
+  private buildFilterConditions(options?: {
+    types?: string[]
+    tags?: string[]
+    minImportance?: number
+    source?: string
+    excludeMentionedWithin?: number
+    includeExpired?: boolean
+  }): Sql[] {
+    const conditions: Sql[] = []
+
+    if (options?.types?.length) {
+      // Use sqlJoin for safe IN clause
+      conditions.push(sql`type IN (${sqlJoin(options.types)})`)
+    }
+
+    if (options?.tags?.length) {
+      // PostgreSQL array containment - cast the parameter array to text[]
+      conditions.push(sql`tags @> ${options.tags}::text[]`)
+    }
+
+    if (options?.minImportance !== undefined) {
+      conditions.push(sql`importance >= ${options.minImportance}`)
+    }
+
+    if (options?.source !== undefined) {
+      conditions.push(sql`source = ${options.source}`)
+    }
+
+    if (options?.excludeMentionedWithin !== undefined) {
+      const hoursAgo = new Date(Date.now() - options.excludeMentionedWithin * 60 * 60 * 1000)
+      conditions.push(
+        sql`("lastMentionedAt" IS NULL OR "lastMentionedAt" < ${hoursAgo})`
+      )
+    }
+
+    // Exclude expired memories unless explicitly requested
+    if (!options?.includeExpired) {
+      conditions.push(sql`("expiresAt" IS NULL OR "expiresAt" > NOW())`)
+    }
+
+    return conditions
+  }
+
+  /**
+   * Non-semantic browse/enumerate within a single namespace.
+   *
+   * Unlike `search()`, this makes no embedding call and returns the public
+   * `Memory` type (no `distance`). Use it for admin/inspection/export:
+   * "show me everything in user:123", "the 20 most recently updated
+   * preferences", etc.
+   *
+   * Nullable order columns (`importance`, `lastMentionedAt`) always sort NULLS
+   * LAST regardless of direction. Ties break on `id ASC` for deterministic
+   * ordering. Pagination is offset-based.
+   *
+   * @param namespace - Isolation key to enumerate within (falls back to default)
+   * @param options - Filter, ordering, and pagination options
+   * @returns Array of memories (public `Memory` shape)
+   */
+  async list(
+    namespace: string | undefined,
+    options?: ListOptions
+  ): Promise<Memory[]> {
+    const ns = this.resolveNamespace(namespace)
+
+    try {
+      const conditions: Sql[] = [
+        sql`namespace = ${ns}`,
+        ...this.buildFilterConditions({
+          types: options?.types,
+          tags: options?.tags,
+          minImportance: options?.minImportance,
+          source: options?.source,
+          includeExpired: options?.includeExpired,
+        }),
+      ]
+      const whereClause = sqlJoin(conditions, ' AND ')
+
+      // ORDER BY column names cannot be parameterized — map through an explicit
+      // allowlist to fixed fragments. Never interpolate the caller's string.
+      const ORDER_COLUMNS: Record<string, Sql> = {
+        createdAt: sql`"createdAt"`,
+        updatedAt: sql`"updatedAt"`,
+        importance: sql`importance`,
+        lastMentionedAt: sql`"lastMentionedAt"`,
+      }
+      const orderColumn = ORDER_COLUMNS[options?.orderBy ?? 'createdAt'] ?? ORDER_COLUMNS.createdAt
+      const orderDir = options?.direction === 'asc' ? sql`ASC` : sql`DESC`
+      const orderClause = sql`${orderColumn} ${orderDir} NULLS LAST, id ASC`
+
+      // Shared with the mock so clamping cannot drift between the two
+      const { limit, offset } = resolveListPagination(options)
+
+      // Explicit column list — never SELECT * (embedding is Unsupported(...) and
+      // would drag a 1536-float vector per row across the wire).
+      const results = await this.prisma.$queryRaw<Memory[]>`
+        SELECT id, namespace, content, type, tags, source, importance,
+          "expiresAt", "lastMentionedAt", "mentionCount", "createdAt", "updatedAt"
+        FROM "Memory"
+        WHERE ${whereClause}
+        ORDER BY ${orderClause}
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `
+
+      // Rows are already in the public Memory shape — return directly.
+      return results
+    } catch (error) {
+      throw new DatabaseError('list', error instanceof Error ? error : undefined)
     }
   }
 

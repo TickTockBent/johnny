@@ -242,6 +242,31 @@ console.log(results[0].namespace)  // "shared"
 console.log(results[0].content)    // "Some shared memory"
 ```
 
+##### `list(namespace, options?)`
+
+Non-semantic browse/enumerate within a single namespace. Unlike `search()`, this makes **no embedding call** and takes **no query** — use it for admin/inspection/export (e.g. "show me everything in `user:123`", "the 20 most recently updated `preference` memories"). Returns the public `Memory[]` type (has `namespace`, **no** `distance`).
+
+```typescript
+const memories = await service.list('user:123', {
+  types: ['preference'],   // Filter by type (type IN ...)
+  tags: ['important'],     // Must have ALL these tags
+  minImportance: 0.5,      // Minimum importance (rows with null importance excluded)
+  source: 'doc:42',        // Exact source match (source is the upsert key)
+  includeExpired: false,   // Include expired rows (default: false)
+  orderBy: 'createdAt',    // 'createdAt' | 'updatedAt' | 'importance' | 'lastMentionedAt' (default: 'createdAt')
+  direction: 'desc',       // 'asc' | 'desc' (default: 'desc')
+  limit: 50,               // Max results (default: 50, clamped to 1000)
+  offset: 0,               // Offset for pagination (default: 0)
+})
+
+// Returns Memory[]
+// { id, namespace, content, type, tags, source, importance, expiresAt, lastMentionedAt, mentionCount, createdAt, updatedAt }
+```
+
+**Ordering:** `importance` and `lastMentionedAt` are nullable; NULLs always sort **last** regardless of direction (overriding Postgres's default of NULLS FIRST on DESC). Ties break on `id` ascending for deterministic ordering.
+
+**Pagination:** offset-based (intended for an admin/export path, not a hot loop). `limit` is clamped to 1000 and non-finite values (`NaN`, `Infinity`) fall back to the default, so a stray `parseInt()` can't turn a page request into a full-namespace scan. There is no total-count companion: `getStats(namespace).totalMemories` counts *every* row in the namespace — including expired ones — and ignores the filters above, so it is only a valid page count for an unfiltered list with no expired rows.
+
 ##### `get(id)`
 
 Retrieve a specific memory by ID.

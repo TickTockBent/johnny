@@ -982,4 +982,306 @@ describe('MockMemoryService', () => {
       expect(multiStats.get('ns1')).toEqual(singleStats)
     })
   })
+
+  describe('list()', () => {
+    // Helper: force a memory's internal createdAt/updatedAt so ordering tests
+    // are unambiguous regardless of wall-clock timing.
+    const setCreatedAt = (id: string, iso: string) => {
+      const internal = (service as unknown as {
+        memories: Map<string, { createdAt: Date; updatedAt: Date }>
+      }).memories.get(id)!
+      internal.createdAt = new Date(iso)
+      internal.updatedAt = new Date(iso)
+    }
+    const setLastMentionedAt = (id: string, iso: string | null) => {
+      const internal = (service as unknown as {
+        memories: Map<string, { lastMentionedAt: Date | null }>
+      }).memories.get(id)!
+      internal.lastMentionedAt = iso === null ? null : new Date(iso)
+    }
+
+    describe('filters', () => {
+      it('filters by types', async () => {
+        await service.store('ns', 'a', { type: 'fact' })
+        await service.store('ns', 'b', { type: 'preference' })
+        await service.store('ns', 'c', { type: 'fact' })
+
+        const results = await service.list('ns', { types: ['fact'] })
+
+        expect(results).toHaveLength(2)
+        expect(results.every((r) => r.type === 'fact')).toBe(true)
+      })
+
+      it('filters by tags with ALL-of semantics', async () => {
+        await service.store('ns', 'both', { tags: ['x', 'y'] })
+        await service.store('ns', 'only-x', { tags: ['x'] })
+        await service.store('ns', 'superset', { tags: ['x', 'y', 'z'] })
+
+        const results = await service.list('ns', { tags: ['x', 'y'] })
+
+        expect(results.map((r) => r.content).sort()).toEqual(['both', 'superset'])
+      })
+
+      it('filters by minImportance and excludes null importance', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-importance')
+
+        const results = await service.list('ns', { minImportance: 0.5 })
+
+        expect(results.map((r) => r.content)).toEqual(['high'])
+      })
+
+      it('filters by exact source match', async () => {
+        await service.store('ns', 'a', { source: 'doc:1' })
+        await service.store('ns', 'b', { source: 'doc:2' })
+
+        const results = await service.list('ns', { source: 'doc:1' })
+
+        expect(results.map((r) => r.content)).toEqual(['a'])
+      })
+
+      it('combines multiple filters', async () => {
+        await service.store('ns', 'match', { type: 'fact', tags: ['t'], importance: 0.8 })
+        await service.store('ns', 'wrong-type', { type: 'note', tags: ['t'], importance: 0.8 })
+        await service.store('ns', 'low-importance', { type: 'fact', tags: ['t'], importance: 0.2 })
+
+        const results = await service.list('ns', {
+          types: ['fact'],
+          tags: ['t'],
+          minImportance: 0.5,
+        })
+
+        expect(results.map((r) => r.content)).toEqual(['match'])
+      })
+    })
+
+    describe('ordering', () => {
+      it('defaults to createdAt desc', async () => {
+        const a = await service.store('ns', 'a')
+        const b = await service.store('ns', 'b')
+        const c = await service.store('ns', 'c')
+        setCreatedAt(a.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-02T00:00:00Z')
+        setCreatedAt(c.id, '2026-01-03T00:00:00Z')
+
+        const results = await service.list('ns')
+
+        expect(results.map((r) => r.content)).toEqual(['c', 'b', 'a'])
+      })
+
+      it('orders by createdAt asc', async () => {
+        const a = await service.store('ns', 'a')
+        const b = await service.store('ns', 'b')
+        setCreatedAt(a.id, '2026-01-02T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-01T00:00:00Z')
+
+        const results = await service.list('ns', { orderBy: 'createdAt', direction: 'asc' })
+
+        expect(results.map((r) => r.content)).toEqual(['b', 'a'])
+      })
+
+      it('orders by importance desc with NULLS LAST', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-a')
+        await service.store('ns', 'null-b')
+
+        const results = await service.list('ns', { orderBy: 'importance', direction: 'desc' })
+
+        // Non-null importance first (desc), then nulls last
+        expect(results.slice(0, 2).map((r) => r.content)).toEqual(['high', 'low'])
+        expect(results.slice(2).map((r) => r.content).sort()).toEqual(['null-a', 'null-b'])
+        expect(results[2].importance).toBeNull()
+        expect(results[3].importance).toBeNull()
+      })
+
+      it('orders by importance asc with NULLS LAST', async () => {
+        await service.store('ns', 'high', { importance: 0.9 })
+        await service.store('ns', 'low', { importance: 0.1 })
+        await service.store('ns', 'null-importance')
+
+        const results = await service.list('ns', { orderBy: 'importance', direction: 'asc' })
+
+        // Ascending non-nulls first, nulls still last (overriding Postgres default)
+        expect(results.map((r) => r.content)).toEqual(['low', 'high', 'null-importance'])
+      })
+
+      it('orders by lastMentionedAt with NULLS LAST', async () => {
+        const a = await service.store('ns', 'mentioned-recent')
+        const b = await service.store('ns', 'mentioned-old')
+        await service.store('ns', 'never-mentioned')
+        setLastMentionedAt(a.id, '2026-05-01T00:00:00Z')
+        setLastMentionedAt(b.id, '2026-04-01T00:00:00Z')
+
+        const results = await service.list('ns', {
+          orderBy: 'lastMentionedAt',
+          direction: 'desc',
+        })
+
+        expect(results.map((r) => r.content)).toEqual([
+          'mentioned-recent',
+          'mentioned-old',
+          'never-mentioned',
+        ])
+        expect(results[2].lastMentionedAt).toBeNull()
+      })
+
+      it('breaks ties on id ascending', async () => {
+        // All share the same createdAt so the sort key ties for every row.
+        const a = await service.store('ns', 'first')
+        const b = await service.store('ns', 'second')
+        const c = await service.store('ns', 'third')
+        setCreatedAt(a.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(b.id, '2026-01-01T00:00:00Z')
+        setCreatedAt(c.id, '2026-01-01T00:00:00Z')
+
+        const results = await service.list('ns', { orderBy: 'createdAt', direction: 'desc' })
+
+        // Despite desc, ties resolve by id ASC (mock-N insertion order)
+        expect(results.map((r) => r.id)).toEqual([a.id, b.id, c.id])
+      })
+    })
+
+    describe('pagination', () => {
+      beforeEach(async () => {
+        for (let index = 0; index < 5; index++) {
+          const memory = await service.store('ns', `item-${index}`)
+          setCreatedAt(memory.id, `2026-01-0${index + 1}T00:00:00Z`)
+        }
+      })
+
+      it('applies limit and offset slicing', async () => {
+        // createdAt desc → item-4, item-3, item-2, item-1, item-0
+        const results = await service.list('ns', { limit: 2, offset: 1 })
+
+        expect(results.map((r) => r.content)).toEqual(['item-3', 'item-2'])
+      })
+
+      it('returns empty array when offset is past the end', async () => {
+        const results = await service.list('ns', { offset: 100 })
+        expect(results).toEqual([])
+      })
+
+      it('clamps limit to MAX_LIST_LIMIT', async () => {
+        const results = await service.list('ns', { limit: 999999 })
+        // Only 5 rows exist, so clamping is not observable in count, but the
+        // call must not throw and must return all rows.
+        expect(results).toHaveLength(5)
+      })
+
+      it('defaults to a limit of 50 when omitted', async () => {
+        service.clear()
+        for (let index = 0; index < 60; index++) {
+          await service.store('ns', `item-${index}`)
+        }
+
+        const results = await service.list('ns')
+
+        expect(results).toHaveLength(50)
+      })
+
+      it('falls back to the default limit for non-finite input', async () => {
+        // NaN arrives easily via parseInt(req.query.limit) on a missing param.
+        // It must not disable the bound — in Postgres a NaN limit serializes to
+        // NULL, which means "no limit at all".
+        service.clear()
+        for (let index = 0; index < 60; index++) {
+          await service.store('ns', `item-${index}`)
+        }
+
+        expect(await service.list('ns', { limit: NaN })).toHaveLength(50)
+        expect(await service.list('ns', { limit: Infinity })).toHaveLength(50)
+        expect(await service.list('ns', { limit: -Infinity })).toHaveLength(50)
+      })
+
+      it('falls back to no offset for non-finite input', async () => {
+        const results = await service.list('ns', { offset: NaN })
+        expect(results.map((r) => r.content)).toEqual([
+          'item-4',
+          'item-3',
+          'item-2',
+          'item-1',
+          'item-0',
+        ])
+        expect(await service.list('ns', { offset: Infinity })).toHaveLength(5)
+      })
+
+      it('truncates fractional limit and offset', async () => {
+        // Postgres rounds LIMIT 1.5 up to 2 while Array.slice takes 1;
+        // truncating in one shared place keeps both implementations agreeing.
+        const results = await service.list('ns', { limit: 2.9, offset: 1.9 })
+        expect(results.map((r) => r.content)).toEqual(['item-3', 'item-2'])
+      })
+
+      it('treats negative limit as zero', async () => {
+        expect(await service.list('ns', { limit: -5 })).toEqual([])
+      })
+    })
+
+    describe('includeExpired', () => {
+      it('excludes expired memories by default', async () => {
+        await service.store('ns', 'fresh', { expiresAt: new Date(Date.now() + 60_000) })
+        await service.store('ns', 'expired', { expiresAt: new Date(Date.now() - 60_000) })
+
+        const results = await service.list('ns')
+
+        expect(results.map((r) => r.content)).toEqual(['fresh'])
+      })
+
+      it('includes expired memories when includeExpired is true', async () => {
+        await service.store('ns', 'fresh', { expiresAt: new Date(Date.now() + 60_000) })
+        await service.store('ns', 'expired', { expiresAt: new Date(Date.now() - 60_000) })
+
+        const results = await service.list('ns', { includeExpired: true })
+
+        expect(results.map((r) => r.content).sort()).toEqual(['expired', 'fresh'])
+      })
+    })
+
+    describe('namespace scoping', () => {
+      it('returns empty array for a namespace with no rows', async () => {
+        await service.store('ns', 'content')
+
+        const results = await service.list('empty-ns')
+
+        expect(results).toEqual([])
+      })
+
+      it('excludes rows from other namespaces', async () => {
+        await service.store('ns-a', 'a')
+        await service.store('ns-b', 'b')
+
+        const results = await service.list('ns-a')
+
+        expect(results.map((r) => r.content)).toEqual(['a'])
+      })
+
+      it('uses the default namespace when namespace is undefined', async () => {
+        await service.store(undefined, 'default-ns-content') // default is 'test'
+
+        const results = await service.list(undefined)
+
+        expect(results.map((r) => r.content)).toEqual(['default-ns-content'])
+      })
+
+      it('throws NamespaceRequiredError with no default and undefined namespace', async () => {
+        const serviceNoDefault = new MockMemoryService()
+
+        await expect(serviceNoDefault.list(undefined)).rejects.toThrow(
+          NamespaceRequiredError
+        )
+      })
+    })
+
+    it('returns the public Memory type (has namespace, no distance)', async () => {
+      await service.store('ns', 'content')
+
+      const results = await service.list('ns')
+
+      expect(results[0]).toHaveProperty('namespace', 'ns')
+      expect(results[0]).not.toHaveProperty('distance')
+      expect(results[0]).not.toHaveProperty('embedding')
+    })
+  })
 })

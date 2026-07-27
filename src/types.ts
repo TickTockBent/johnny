@@ -170,6 +170,38 @@ export interface SearchOptions {
 }
 
 /**
+ * Options for non-semantic browse/enumerate via `list()`.
+ *
+ * Reuses the filter vocabulary of {@link SearchOptions} so the two feel like
+ * siblings. Unlike `search()`, there is no query and no embedding call — this
+ * is an admin/inspection/export path.
+ */
+export interface ListOptions {
+  /** Filter to specific types (`type IN (...)`) */
+  types?: string[]
+  /** Filter to memories with ALL of these tags (ALL-of, same as search) */
+  tags?: string[]
+  /** Filter by minimum importance threshold (rows with null importance excluded) */
+  minImportance?: number
+  /** Filter by exact source match (useful given `source` is the upsert key) */
+  source?: string
+  /** Include expired memories (default: false — expired rows are excluded) */
+  includeExpired?: boolean
+  /**
+   * Column to order by (default: 'createdAt').
+   * `importance` and `lastMentionedAt` are nullable; NULLs always sort LAST
+   * regardless of direction (overriding Postgres's default NULLS FIRST on DESC).
+   */
+  orderBy?: 'createdAt' | 'updatedAt' | 'importance' | 'lastMentionedAt'
+  /** Sort direction (default: 'desc') */
+  direction?: 'asc' | 'desc'
+  /** Max results (default: 50, clamped to a maximum of 1000) */
+  limit?: number
+  /** Offset for pagination (default: 0) */
+  offset?: number
+}
+
+/**
  * Memory with similarity score from search results
  */
 export interface MemorySearchResult {
@@ -246,6 +278,7 @@ export interface IMemoryService {
   storeMany(namespace: string | undefined, items: CreateMemory[]): Promise<Memory[]>
   search(namespace: string | undefined, query: string, options?: SearchOptions): Promise<MemorySearchResult[]>
   searchAcross(namespaces: string[], query: string, options?: SearchOptions): Promise<CrossNamespaceSearchResult[]>
+  list(namespace: string | undefined, options?: ListOptions): Promise<Memory[]>
   get(id: string): Promise<Memory | null>
   update(id: string, updates: MemoryUpdate): Promise<Memory>
   updateContent(id: string, content: string, metadata?: MemoryUpdate): Promise<Memory>

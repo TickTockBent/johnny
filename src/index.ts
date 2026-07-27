@@ -18,6 +18,7 @@ export type {
   MemoryUpdate,
   CreateMemory,
   SearchOptions,
+  ListOptions,
   MemorySearchResult,
   CrossNamespaceSearchResult,
   DecayOptions,

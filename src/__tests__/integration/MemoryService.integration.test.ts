@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { MemoryService } from '../../MemoryService'
+import { MockMemoryService } from '../../MockMemoryService'
+import type { IMemoryService, ListOptions } from '../../types'
 import { NotFoundError, NamespaceRequiredError } from '../../errors'
 import { setupIntegrationTests } from './setup'
 
@@ -710,6 +712,135 @@ describe('MemoryService Integration', () => {
 
       const count = await prisma.memory.count()
       expect(count).toBe(1)
+    })
+  })
+
+  describe('list()', () => {
+    // Seed identical fixtures into any IMemoryService. A small delay between
+    // stores guarantees strictly-increasing createdAt in both the real DB
+    // (NOW()) and the mock (Date.now()), so createdAt ordering is unambiguous.
+    const seed = async (service: IMemoryService, namespace: string) => {
+      await service.store(namespace, 'alpha', { type: 'fact', importance: 0.9, source: 'src-a' })
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'bravo', { type: 'note', importance: 0.5, source: 'src-b' })
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'charlie', { type: 'fact', source: 'src-c' }) // null importance
+      await new Promise((resolve) => setTimeout(resolve, 3))
+      await service.store(namespace, 'delta', {
+        type: 'fact',
+        importance: 0.2,
+        source: 'src-d',
+        expiresAt: new Date(Date.now() - 60_000), // expired
+      })
+    }
+
+    // Assert the real service and the mock produce the same content ordering
+    // for a given list() call — the parity guarantee behind IMemoryService.
+    const assertParity = async (namespace: string, options?: ListOptions) => {
+      const real = createService()
+      const mock = new MockMemoryService()
+      await seed(real, namespace)
+      await seed(mock, namespace)
+
+      const realResults = await real.list(namespace, options)
+      const mockResults = await mock.list(namespace, options)
+
+      expect(realResults.map((r) => r.content)).toEqual(mockResults.map((r) => r.content))
+      return realResults
+    }
+
+    it('default order (createdAt desc) matches the mock', async () => {
+      // Expired 'delta' excluded; newest-first over the remaining rows.
+      const results = await assertParity('parity')
+      expect(results.map((r) => r.content)).toEqual(['charlie', 'bravo', 'alpha'])
+    })
+
+    it('orderBy importance desc puts the null-importance row last (NULLS LAST)', async () => {
+      const results = await assertParity('parity', { orderBy: 'importance', direction: 'desc' })
+      expect(results.map((r) => r.content)).toEqual(['alpha', 'bravo', 'charlie'])
+      expect(results[results.length - 1].importance).toBeNull()
+    })
+
+    it('orderBy importance asc keeps the null row last', async () => {
+      const results = await assertParity('parity', { orderBy: 'importance', direction: 'asc' })
+      expect(results.map((r) => r.content)).toEqual(['bravo', 'alpha', 'charlie'])
+    })
+
+    it('source filter matches the mock', async () => {
+      const results = await assertParity('parity', { source: 'src-a' })
+      expect(results.map((r) => r.content)).toEqual(['alpha'])
+    })
+
+    it('includeExpired includes the expired row', async () => {
+      const results = await assertParity('parity', {
+        includeExpired: true,
+        orderBy: 'importance',
+        direction: 'asc',
+      })
+      expect(results.map((r) => r.content)).toEqual(['delta', 'bravo', 'alpha', 'charlie'])
+    })
+
+    it('offset/limit paging matches the mock', async () => {
+      const results = await assertParity('parity', {
+        orderBy: 'importance',
+        direction: 'desc',
+        limit: 2,
+        offset: 1,
+      })
+      expect(results.map((r) => r.content)).toEqual(['bravo', 'charlie'])
+    })
+
+    it('non-finite limit falls back to the default instead of unbounding the query', async () => {
+      // Regression: NaN survived the old Math.min/Math.max clamp, serialized to
+      // SQL NULL, and Postgres read `LIMIT NULL` as no limit — returning the
+      // whole namespace. Seed past the default so a bypass is visible.
+      const service = createService()
+      await service.storeMany(
+        'unbounded',
+        Array.from({ length: 60 }, (_, index) => ({ content: `row-${index}` }))
+      )
+
+      expect(await service.list('unbounded', { limit: NaN })).toHaveLength(50)
+      expect(await service.list('unbounded', { offset: NaN })).toHaveLength(50)
+      expect(await service.list('unbounded', { offset: Infinity })).toHaveLength(50)
+    })
+
+    it('fractional limit truncates identically to the mock', async () => {
+      const results = await assertParity('parity', {
+        orderBy: 'importance',
+        direction: 'desc',
+        limit: 2.9,
+      })
+      expect(results.map((r) => r.content)).toEqual(['alpha', 'bravo'])
+    })
+
+    it('returns public Memory rows with namespace and no distance/embedding', async () => {
+      const service = createService()
+      await seed(service, 'shape')
+
+      const results = await service.list('shape')
+
+      expect(results.length).toBeGreaterThan(0)
+      for (const row of results) {
+        expect(row.namespace).toBe('shape')
+        expect(row).not.toHaveProperty('distance')
+        expect(row).not.toHaveProperty('embedding')
+      }
+    })
+
+    it('uses the default namespace and scopes to it', async () => {
+      const service = createService('default-list-ns')
+      await service.store(undefined, 'in-default')
+      await service.store('other-ns', 'elsewhere')
+
+      const results = await service.list(undefined)
+
+      expect(results.map((r) => r.content)).toEqual(['in-default'])
+    })
+
+    it('throws NamespaceRequiredError with no default and undefined namespace', async () => {
+      const service = createService()
+      await expect(service.list(undefined)).rejects.toThrow(NamespaceRequiredError)
     })
   })
 })

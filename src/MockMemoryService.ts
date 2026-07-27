@@ -4,12 +4,14 @@ import type {
   MemoryUpdate,
   CreateMemory,
   SearchOptions,
+  ListOptions,
   MemorySearchResult,
   CrossNamespaceSearchResult,
   NamespaceStats,
   IMemoryService,
 } from './types'
 import { NotFoundError, NamespaceRequiredError } from './errors'
+import { resolveListPagination } from './pagination'
 
 /**
  * Configuration options for MockMemoryService
@@ -338,6 +340,98 @@ export class MockMemoryService implements IMemoryService {
       lastMentionedAt: memory.lastMentionedAt,
       mentionCount: memory.mentionCount,
     }))
+  }
+
+  /**
+   * Non-semantic browse/enumerate within a single namespace.
+   *
+   * Mirrors {@link MemoryService.list}: same tag ALL-of rule, same expiry
+   * exclusion, same NULLS LAST ordering, and the same pagination clamping
+   * (shared via `resolveListPagination`). Returns the public `Memory` type
+   * (no `distance`).
+   *
+   * One deliberate limit on that parity: ties on the sort key break on `id`
+   * ascending, which makes each implementation deterministic across repeated
+   * calls but not identical to the other — real ids are `gen_random_uuid()`
+   * while mock ids are `mock-N`, so tied rows can order differently here than
+   * in Postgres. Don't assert cross-implementation ordering on tied keys.
+   */
+  async list(
+    namespace: string | undefined,
+    options?: ListOptions
+  ): Promise<Memory[]> {
+    const ns = this.resolveNamespace(namespace)
+    const now = new Date()
+
+    // Filter with the same predicates as the real WHERE clause.
+    const filtered = Array.from(this.memories.values()).filter((memory) => {
+      if (memory.namespace !== ns) return false
+
+      if (options?.types?.length) {
+        if (memory.type === null || !options.types.includes(memory.type)) return false
+      }
+
+      if (options?.tags?.length) {
+        if (!options.tags.every((tag) => memory.tags.includes(tag))) return false
+      }
+
+      if (options?.minImportance !== undefined) {
+        if (memory.importance === null || memory.importance < options.minImportance) return false
+      }
+
+      if (options?.source !== undefined) {
+        if (memory.source !== options.source) return false
+      }
+
+      // Exclude expired unless explicitly requested
+      if (!options?.includeExpired && memory.expiresAt && memory.expiresAt < now) {
+        return false
+      }
+
+      return true
+    })
+
+    // Resolve the sort key for a row. Dates are compared by their numeric value.
+    const orderBy = options?.orderBy ?? 'createdAt'
+    const sortKey = (memory: InternalMemory): number | null => {
+      switch (orderBy) {
+        case 'importance':
+          return memory.importance
+        case 'lastMentionedAt':
+          return memory.lastMentionedAt ? memory.lastMentionedAt.getTime() : null
+        case 'updatedAt':
+          return memory.updatedAt.getTime()
+        case 'createdAt':
+        default:
+          return memory.createdAt.getTime()
+      }
+    }
+
+    const ascending = options?.direction === 'asc'
+
+    const sorted = filtered.sort((a, b) => {
+      const keyA = sortKey(a)
+      const keyB = sortKey(b)
+
+      // NULLS LAST: null always sorts after non-null, regardless of direction.
+      if (keyA === null && keyB === null) {
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+      }
+      if (keyA === null) return 1
+      if (keyB === null) return -1
+
+      if (keyA !== keyB) {
+        return ascending ? keyA - keyB : keyB - keyA
+      }
+
+      // Stable tiebreak: id ascending (string compare).
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    })
+
+    // Shared with the real service so clamping cannot drift between the two
+    const { limit, offset } = resolveListPagination(options)
+
+    return sorted.slice(offset, offset + limit).map((memory) => this.toPublicMemory(memory))
   }
 
   /**
